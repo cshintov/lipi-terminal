@@ -21,6 +21,7 @@
 @class iTermTerminalButton;
 @class iTermTextExtractor;
 @class PTYFontInfo;
+@class ScreenCharArray;
 @protocol VT100ScreenMarkReading;
 
 NS_ASSUME_NONNULL_BEGIN
@@ -34,6 +35,8 @@ NS_ASSUME_NONNULL_BEGIN
 - (id<VT100ScreenMarkReading> _Nullable)drawingHelperMarkOnLine:(int)line;
 
 - (const screen_char_t *)drawingHelperLineAtIndex:(int)line;
+// Owned snapshot: cells, count and metadata must describe the same row.
+- (ScreenCharArray * _Nullable)drawingHelperRowAtIndex:(int)line;
 - (const screen_char_t *)drawingHelperLineAtScreenIndex:(int)line;
 
 - (NSArray * _Nullable)drawingHelperCharactersWithNotesOnLine:(int)line;

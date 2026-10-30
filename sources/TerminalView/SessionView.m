@@ -145,6 +145,9 @@ NSString *const SessionViewWasSelectedForInspectionNotification = @"SessionViewW
 
     BOOL _showTitle;
     BOOL _showBottomStatusBar;
+    iTermMalayalamCellStrip *_malayalamCellStrip;
+    long long _malayalamStripAbsoluteRow;
+    NSString *_malayalamFooterTraceState;
     SessionTitleView *_title;
 
     iTermHoverContainerView *_hoverURLView;
@@ -271,6 +274,23 @@ NSString *const SessionViewWasSelectedForInspectionNotification = @"SessionViewW
 
         // assign the main view
         [self addSubviewBelowFindView:_scrollview];
+
+        if ([iTermAdvancedSettingsModel malayalamNaturalRows]) {
+            _malayalamStripAbsoluteRow = -1;
+            _malayalamCellStrip = [[iTermMalayalamCellStrip alloc] initWithFrame:NSZeroRect];
+            _malayalamCellStrip.statusText = @"Awaiting active row";
+            __weak SessionView *weakSelf = self;
+            _malayalamCellStrip.didSelectColumn = ^(NSInteger column) {
+                SessionView *strongSelf = weakSelf;
+                if (!strongSelf) { return; }
+                PTYTextView *textView = [strongSelf malayalamTerminalTextView];
+                [textView selectMalayalamColumn:column absoluteRow:strongSelf->_malayalamStripAbsoluteRow];
+                [textView.window makeFirstResponder:textView];
+            };
+            [self addSubviewBelowFindView:_malayalamCellStrip];
+            [[NSNotificationCenter defaultCenter] addObserver:self
+                selector:@selector(malayalamRowDidDraw:) name:@"iTermMalayalamRowDidDraw" object:nil];
+        }
 
         if ([iTermAdvancedSettingsModel showLocationsInScrollbar]) {
             _searchResultsMinimap = [[iTermSearchResultsMinimapView alloc] init];
@@ -1927,12 +1947,13 @@ typedef struct {
     if (self.showBottomStatusBar) {
         insets.bottom = iTermGetStatusBarHeight();
     }
+    insets.bottom += _malayalamCellStrip ? 28 : 0;
     return insets;
 }
 
 - (NSRect)insetRect:(NSRect)rect flipped:(BOOL)flipped includeBottomStatusBar:(BOOL)includeBottomStatusBar {
     CGFloat topInset = self.extraMargins.top;
-    CGFloat bottomInset = 0;
+    CGFloat bottomInset = _malayalamCellStrip ? 28 : 0;
 
     // Most callers don't inset for per-pane status bars because not all panes
     // might have status bars and this function is used to compute the window's
@@ -2528,11 +2549,50 @@ typedef struct {
     [_dropDownFindViewController setOffsetFromTopRightOfSuperview:NSMakeSize(30, 0)];
 }
 
+- (PTYTextView *)malayalamTerminalTextView {
+    // The scroll document is TextViewWrapper, not the terminal view.
+    PTYSession *session = (PTYSession *)self.delegate;
+    return [session isKindOfClass:[PTYSession class]] ? session.textview : nil;
+}
+
+- (void)malayalamRowDidDraw:(NSNotification *)notification {
+    PTYTextView *textView = [self malayalamTerminalTextView];
+    if (!_malayalamCellStrip || notification.object != textView) {
+        return;
+    }
+    NSDictionary *state = [textView malayalamCellStripState];
+    _malayalamCellStrip.columnCount = [state[@"width"] integerValue];
+    _malayalamCellStrip.cursorColumn = state ? [state[@"cursor"] integerValue] : -1;
+    _malayalamCellStrip.focusColumn = [state[@"focus"] integerValue];
+    _malayalamCellStrip.selectedColumns = state[@"selected"] ?: [NSIndexSet indexSet];
+    _malayalamCellStrip.statusText = state[@"status"] ?: @"Row unavailable";
+    _malayalamCellStrip.toolTip = _malayalamCellStrip.statusText;
+    _malayalamStripAbsoluteRow = state ? [state[@"row"] longLongValue] : -1;
+    const char *trace = getenv("ITERM2_MALAYALAM_TRACE");
+    if (trace && !strcmp(trace, "1")) {
+        NSString *geometry = [NSString stringWithFormat:
+            @"row=%lld columns=%ld cursor=%ld focus=%ld selectedCount=%lu footer=%@ terminal=%@ status=%@",
+            _malayalamStripAbsoluteRow, (long)_malayalamCellStrip.columnCount,
+            (long)_malayalamCellStrip.cursorColumn, (long)_malayalamCellStrip.focusColumn,
+            (unsigned long)_malayalamCellStrip.selectedColumns.count,
+            NSStringFromRect(_malayalamCellStrip.frame), NSStringFromRect(_scrollview.frame),
+            _malayalamCellStrip.statusText];
+        if (![_malayalamFooterTraceState isEqualToString:geometry]) {
+            _malayalamFooterTraceState = geometry;
+            fprintf(stderr, "ML_FOOTER %s\n", geometry.UTF8String);
+        }
+    }
+}
+
 - (void)updateScrollViewFrame {
     DLog(@"update scrollview frame");
     CGFloat titleHeight = _showTitle ? _title.frame.size.height : 0;
     CGFloat toolbarHeight = [self toolbarReservedHeight];
     CGFloat reservedSpaceOnBottom = _showBottomStatusBar ? iTermGetStatusBarHeight() : 0;
+    if (_malayalamCellStrip) {
+        _malayalamCellStrip.frame = NSMakeRect(0, reservedSpaceOnBottom, self.frame.size.width, 28);
+        reservedSpaceOnBottom += 28;
+    }
     NSSize proposedSize = NSMakeSize(self.frame.size.width,
                                      self.frame.size.height - titleHeight - toolbarHeight - reservedSpaceOnBottom);
     NSSize size = [_delegate sessionViewScrollViewWillResize:proposedSize];

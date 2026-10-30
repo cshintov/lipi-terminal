@@ -43,6 +43,9 @@ iTermURLActionHelperDelegate>
 
 - (VT100GridCoord)coordForPoint:(NSPoint)locationInTextView
        allowRightMarginOverflow:(BOOL)allowRightMarginOverflow;
+// Viewport/renderer setup needs only grid geometry, never the configured drawing helper.
+- (VT100GridCoord)gridCoordForPoint:(NSPoint)locationInTextView
+           allowRightMarginOverflow:(BOOL)allowRightMarginOverflow;
 
 - (NSPoint)pointForCoord:(VT100GridCoord)coord;
 

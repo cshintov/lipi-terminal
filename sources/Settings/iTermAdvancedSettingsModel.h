@@ -419,6 +419,7 @@ extern NSString *const iTermAdvancedSettingsDidChange;
 + (int)asyncPreconvertMaxOutstandingBytes;
 + (BOOL)logNonASCIIStringLengthHistogram;
 + (BOOL)preferSpeedToFullLigatureSupport;
++ (BOOL)malayalamNaturalRows;
 + (BOOL)enableContextualAlternates;
 + (BOOL)preserveFontSizeOnAutomaticProfileSwitch;
 + (NSString *)preferredBaseDir;

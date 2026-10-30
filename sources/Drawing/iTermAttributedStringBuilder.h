@@ -18,6 +18,8 @@
 @class iTermColorMap;
 @protocol iTermExternalAttributeIndexReading;
 @class iTermFontTable;
+@class iTermMalayalamRowLayout;
+@class ScreenCharArray;
 
 @protocol iTermAttributedStringBuilderDelegate<NSObject>
 @property (nonatomic, readonly) BOOL useSelectedTextColor;
@@ -73,6 +75,13 @@ extern NSString *const iTermKittyImageIDAttribute;
 extern NSString *const iTermKittyImagePlacementIDAttribute;
 
 @interface iTermAttributedStringBuilder: NSObject
+
+// Experimental plain/bold/italic text rows. The caller displays explicit fallback status on nil.
+- (iTermMalayalamRowLayout *)malayalamLayoutForRow:(ScreenCharArray *)row
+                                   expectedWidth:(int)expectedWidth
+                                  backgroundRuns:(NSArray<iTermBoxedBackgroundColorRun *> *)backgroundRuns
+                                     findMatches:(NSData *)findMatches
+                                          reason:(NSString **)reason;
 
 @property (nonatomic, strong, readonly) iTermColorMap *colorMap;
 @property (nonatomic, readonly) BOOL reverseVideo;

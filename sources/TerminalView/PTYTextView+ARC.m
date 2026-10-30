@@ -311,6 +311,20 @@ iTermCommandInfoViewControllerDelegate>
 
 - (VT100GridCoord)coordForPoint:(NSPoint)locationInTextView
        allowRightMarginOverflow:(BOOL)allowRightMarginOverflow {
+    VT100GridCoord coord = [self gridCoordForPoint:locationInTextView
+                         allowRightMarginOverflow:allowRightMarginOverflow];
+    if ([iTermAdvancedSettingsModel malayalamNaturalRows]) {
+        NSNumber *column = [self.drawingHelper malayalamColumnForX:locationInTextView.x line:coord.y];
+        if (column) {
+            const int limit = [self.dataSource width] - (allowRightMarginOverflow ? 0 : 1);
+            coord.x = MAX(0, MIN(column.intValue, limit));
+        }
+    }
+    return coord;
+}
+
+- (VT100GridCoord)gridCoordForPoint:(NSPoint)locationInTextView
+           allowRightMarginOverflow:(BOOL)allowRightMarginOverflow {
     int x, y;
     int width = [self.dataSource width];
 
@@ -381,6 +395,12 @@ iTermCommandInfoViewControllerDelegate>
 }
 
 - (NSPoint)pointForCoord:(VT100GridCoord)coord {
+    if ([iTermAdvancedSettingsModel malayalamNaturalRows]) {
+        NSNumber *naturalX = [self.drawingHelper malayalamXForColumn:coord.x line:coord.y];
+        if (naturalX) {
+            return NSMakePoint(naturalX.doubleValue, coord.y * self.lineHeight);
+        }
+    }
     return NSMakePoint([iTermPreferences sideMargins] + coord.x * self.charWidth,
                        coord.y * self.lineHeight);
 }
@@ -2527,7 +2547,8 @@ toggleAnimationOfImage:(id<iTermImageInfoReading>)imageInfo {
     }
 
     [helper configureForOffscreenRenderingWithFrame:NSMakeRect(0, 0, imageWidth, imageHeight)
-                                        visibleRect:contentRect];
+                                        visibleRect:contentRect
+                                       renderedRows:NSMakeRange(lineRange.location, actualLength)];
 
     [helper drawTextViewContentInRect:contentRect
                              rectsPtr:&contentRect

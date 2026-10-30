@@ -130,14 +130,21 @@ class TextClipDrawing: NSObject {
             return
         }
 
-        var lines = range.closedRangeForY.map { i -> ScreenCharArray in
-            let line = delegate.drawingHelperLine(at: i)
-            let bidi = delegate.drawingHelperBidiInfo(forLine: i)
-            let sca = ScreenCharArray(copyOfLine: line,
-                                      length: width,
-                                      continuation: line[Int(clamping: width)],
-                                      bidiInfo: bidi)
-            return sca
+        var lines = [ScreenCharArray]()
+        for i in range.closedRangeForY {
+            if iTermAdvancedSettingsModel.malayalamNaturalRows() {
+                guard let row = delegate.drawingHelperRow(at: i), row.length == width else {
+                    return
+                }
+                lines.append(row)
+            } else {
+                let line = delegate.drawingHelperLine(at: i)
+                let bidi = delegate.drawingHelperBidiInfo(forLine: i)
+                lines.append(ScreenCharArray(copyOfLine: line,
+                                             length: width,
+                                             continuation: line[Int(clamping: width)],
+                                             bidiInfo: bidi))
+            }
         }
         if lines.isEmpty {
             DLog("No lines")
@@ -337,6 +344,11 @@ extension TextClipDrawing: iTermTextDrawingHelperDelegate {
             return emptyLine.line
         }
         return lines[adjusted].line
+    }
+
+    func drawingHelperRow(at line: Int32) -> ScreenCharArray? {
+        let adjusted = Int(line - firstLine)
+        return (lines.indices.contains(adjusted) ? lines[adjusted] : emptyLine).clone()
     }
 
     func drawingHelperLine(atScreenIndex line: Int32) -> UnsafePointer<screen_char_t> {

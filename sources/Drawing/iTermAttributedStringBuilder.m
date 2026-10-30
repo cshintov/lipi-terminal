@@ -16,6 +16,7 @@
 #import "iTermExternalAttributeIndex.h"
 #import "iTermColorMap.h"
 #import "iTermMutableAttributedStringBuilder.h"
+#import "ScreenCharArray.h"
 
 #define likely(x) __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
@@ -1266,6 +1267,170 @@ withExtendedAttributes:(iTermExternalAttribute *)ea2 {
     _fontProvider = [other.fontProvider cloneFontProvider];
     _fontTable = other.fontTable;
     _delegate = delegate;
+}
+
+- (iTermMalayalamRowLayout *)malayalamLayoutForRow:(ScreenCharArray *)row
+                                   expectedWidth:(int)expectedWidth
+                                  backgroundRuns:(NSArray<iTermBoxedBackgroundColorRun *> *)backgroundRuns
+                                     findMatches:(NSData *)findMatches
+                                          reason:(NSString **)reason {
+    // Localization unneeded: stable opt-in diagnostic identifiers, not UI text.
+    if (reason) { *reason = @"no-Malayalam"; }
+    if (!row || expectedWidth <= 0 || row.length != expectedWidth) {
+        if (reason) { *reason = @"row-width-mismatch"; }
+        return nil;
+    }
+    if (_reverseVideo) {
+        if (reason) { *reason = @"invalid-row-or-reverse-video"; }
+        return nil;
+    }
+    const screen_char_t *line = row.line;
+    const int width = row.length;
+    id<iTermExternalAttributeIndexReading> eaIndex = row.eaIndex;
+    // A solid indexed row background does not introduce an interior shaping boundary.
+    BOOL uniformIndexedBackground = line[0].backgroundColorMode == ColorModeNormal;
+    for (int column = 1; column < width && uniformIndexedBackground; column++) {
+        uniformIndexedBackground = line[column].backgroundColorMode == ColorModeNormal &&
+            line[column].backgroundColor == line[0].backgroundColor;
+    }
+    int contentEnd = width;
+    while (contentEnd > 0 && !line[contentEnd - 1].complexChar &&
+           !line[contentEnd - 1].image && line[contentEnd - 1].code == 0) {
+        contentEnd--;
+    }
+    NSMutableAttributedString *text = [[NSMutableAttributedString alloc] init];
+    NSMutableArray<NSNumber *> *boundaries = [NSMutableArray arrayWithObject:@0];
+    BOOL foundMalayalam = NO;
+    static NSCharacterSet *commonCharacters;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSMutableCharacterSet *characters = [[NSCharacterSet punctuationCharacterSet] mutableCopy];
+        [characters formUnionWithCharacterSet:[NSCharacterSet symbolCharacterSet]];
+        [characters formUnionWithCharacterSet:[NSCharacterSet whitespaceCharacterSet]];
+        [characters formIntersectionWithCharacterSet:[[NSCharacterSet controlCharacterSet] invertedSet]];
+        [characters formIntersectionWithCharacterSet:[[NSCharacterSet newlineCharacterSet] invertedSet]];
+        commonCharacters = [characters copy];
+    });
+    for (int column = 0; column < width; column++) {
+        screen_char_t c = line[column];
+        iTermExternalAttribute *ea = eaIndex[column];
+        const BOOL defaultBackground = c.backgroundColorMode == ColorModeAlternate &&
+            (c.backgroundColor == ALTSEM_DEFAULT || c.backgroundColor == ALTSEM_REVERSED_DEFAULT);
+        // Unsupported presentation must stay on the original renderer with visible status.
+        if (c.image || c.faint || c.blink || c.invisible ||
+            c.underline || c.strikethrough || ea.controlCode.valid || ea.url ||
+            (!defaultBackground && !uniformIndexedBackground)) {
+            if (reason) { *reason = @"unsupported-presentation-or-background"; }
+            return nil;
+        }
+        NSString *source;
+        if (column >= contentEnd || ScreenCharIsDWC_RIGHT(c) || ScreenCharIsDWL_SPACER(c)) {
+            source = @"";
+        } else if (!c.complexChar && c.code == 0) {
+            source = @" ";
+        } else {
+            source = ScreenCharToStr(&c) ?: @"";
+        }
+        for (NSUInteger i = 0; i < source.length; i++) {
+            const unichar scalar = [source characterAtIndex:i];
+            if (scalar >= 0x0d00 && scalar <= 0x0d7f) {
+                foundMalayalam = YES;
+            } else if (scalar < 32 || scalar > 126) {
+                // Common prompt punctuation/symbols/spaces can shape with Malayalam, not other scripts.
+                const BOOL surrogate = CFStringIsSurrogateHighCharacter(scalar) || CFStringIsSurrogateLowCharacter(scalar);
+                if (scalar != 0x200c && scalar != 0x200d &&
+                    (surrogate || ![commonCharacters characterIsMember:scalar])) {
+                    if (reason) { *reason = @"unsupported-script-or-control"; }
+                    return nil;
+                }
+            }
+        }
+        if (source.length) {
+            BOOL fakeBold = c.bold;
+            BOOL fakeItalic = c.italic;
+            UTF32Char remapped = 0;
+            PTYFontInfo *font = [_fontProvider fontForCharacter:[source longCharacterAtIndex:0]
+                                                  useBoldFont:_boldAllowed
+                                                useItalicFont:_italicAllowed
+                                                   renderBold:&fakeBold
+                                                 renderItalic:&fakeItalic
+                                                     remapped:&remapped];
+            if (!font.font || remapped) {
+                if (reason) { *reason = @"font-color-or-remapping"; }
+                return nil;
+            }
+            NSFont *renderFont = font.font;
+            if (fakeItalic) {
+                // Put synthesis in the font so shaping, caret geometry and ink use the same matrix.
+                CGAffineTransform matrix = CGAffineTransformConcat(CTFontGetMatrix((__bridge CTFontRef)renderFont),
+                                                                    CGAffineTransformMake(1, 0, 0.2, 1, 0, 0));
+                renderFont = CFBridgingRelease(CTFontCreateCopyWithAttributes((__bridge CTFontRef)renderFont,
+                                                                             0, &matrix, NULL));
+                if (!renderFont) {
+                    if (reason) { *reason = @"italic-font-creation"; }
+                    return nil;
+                }
+            }
+            [text appendAttributedString:[[NSAttributedString alloc] initWithString:source attributes:@{
+                NSFontAttributeName: renderFont,
+                (NSString *)kCTLigatureAttributeName: @1,
+                iTermBoldAttribute: @(c.bold),
+                iTermFakeBoldAttribute: @(fakeBold)
+            }]];
+        }
+        [boundaries addObject:@(text.length)];
+    }
+    NSMutableIndexSet *selected = [NSMutableIndexSet indexSet];
+    for (iTermBoxedBackgroundColorRun *box in backgroundRuns) {
+        const iTermBackgroundColorRun *run = box.valuePointer;
+        if (run->modelRange.location > width || run->modelRange.length > width - run->modelRange.location) {
+            if (reason) { *reason = @"background-run-range"; }
+            return nil;
+        }
+        if (run->selected) { [selected addIndexesInRange:run->modelRange]; }
+    }
+    NSIndexSet *filledSelection = [iTermMalayalamRowLayout wholeSelectedColumnsForText:text.string
+                                                               cellUTF16Boundaries:boundaries
+                                                                    selectedColumns:selected];
+    // Color-only presentation is applied before the single CTLine is shaped.
+    for (iTermBoxedBackgroundColorRun *box in backgroundRuns) {
+        iTermBackgroundColorRun run = *box.valuePointer;
+        run.selected = [filledSelection containsIndexesInRange:run.modelRange];
+        iTermTextColorContext context = {
+            .dimmingAmount = _colorMap.dimmingAmount,
+            .mutingAmount = _colorMap.mutingAmount,
+            .hasSelectedText = run.selected,
+            .colorMap = _colorMap,
+            .delegate = _delegate,
+            .findMatches = findMatches,
+            .reverseVideo = _reverseVideo,
+            .backgroundColor = [_delegate unprocessedColorForBackgroundRun:&run enableBlending:YES],
+            .minimumContrast = _minimumContrast,
+        };
+        BOOL previousContrastIneligible = NO;
+        for (NSUInteger column = run.modelRange.location; column < NSMaxRange(run.modelRange); column++) {
+            const NSRange source = NSMakeRange(boundaries[column].unsignedIntegerValue,
+                boundaries[column + 1].unsignedIntegerValue - boundaries[column].unsignedIntegerValue);
+            if (!source.length) { continue; }
+            screen_char_t c = line[column];
+            const BOOL contrastIneligible = !c.complexChar &&
+                [[iTermBoxDrawingBezierCurveFactory blockDrawingCharacters] characterIsMember:c.code];
+            if (contrastIneligible != previousContrastIneligible) {
+                context.havePreviousCharacterAttributes = NO;
+            }
+            previousContrastIneligible = contrastIneligible;
+            NSColor *color = iTermTextDrawingHelperGetTextColor(&c, eaIndex[column], NO, (int)column,
+                                                               &context, &run, contrastIneligible);
+            if (!color) {
+                if (reason) { *reason = @"font-color-or-remapping"; }
+                return nil;
+            }
+            [text addAttribute:(NSString *)kCTForegroundColorAttributeName value:(id)color.CGColor range:source];
+        }
+    }
+    if (foundMalayalam && reason) { *reason = @"natural"; }
+    return foundMalayalam ? [[iTermMalayalamRowLayout alloc] initWithAttributedString:text
+                                                               cellUTF16Boundaries:boundaries] : nil;
 }
 
 - (NSString *)statisticsString {

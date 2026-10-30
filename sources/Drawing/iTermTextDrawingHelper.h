@@ -17,6 +17,7 @@
 #import "VT100GridTypes.h"
 
 @class iTermAttributedStringBuilder;
+@class iTermMalayalamRowLayout;
 @class iTermBoxedBackgroundColorRun;
 @class iTermButtonPillInfo;
 @class iTermColorMap;
@@ -34,6 +35,7 @@
 @class PTYFontInfo;
 @class ScreenCharArray;
 @protocol VT100ScreenMarkReading;
+
 
 typedef NS_ENUM(NSUInteger, iTermMarkIndicatorType) {
     iTermMarkIndicatorTypeSuccess,
@@ -125,6 +127,11 @@ extern const int iTermTextDrawingHelperLineStyleMarkRightInsetCells;
 extern const CGFloat iTermCursorGuideAlphaThreshold;
 
 @interface iTermTextDrawingHelper : NSObject
+
+// Experimental shared geometry, in document-row coordinates. nil means original grid layout.
+- (iTermMalayalamRowLayout *)malayalamLayoutAtLine:(int)line;
+- (NSNumber *)malayalamXForColumn:(int)column line:(int)line;
+- (NSNumber *)malayalamColumnForX:(CGFloat)x line:(int)line;
 
 // Holds the current selection, if any.
 @property(nonatomic, retain) iTermSelection *selection;
@@ -534,8 +541,10 @@ extern const CGFloat iTermCursorGuideAlphaThreshold;
 
 // Configure cached metrics for offscreen rendering without calling delegate methods.
 // Use this when rendering to an offscreen bitmap where the delegate's geometry is different.
+// renderedRows excludes image margins and is the exact requested source-row coverage.
 - (void)configureForOffscreenRenderingWithFrame:(NSRect)frame
-                                    visibleRect:(NSRect)visibleRect;
+                                    visibleRect:(NSRect)visibleRect
+                                   renderedRows:(NSRange)renderedRows;
 
 @end
 
