@@ -1792,6 +1792,8 @@ static TECObjectRef CreateTECConverterForUTF8Variants(TextEncodingVariant varian
         return;
     }
     const bool aggressive = [iTermAdvancedSettingsModel aggressiveBaseCharacterDetection];
+    const bool naturalMalayalam = [iTermAdvancedSettingsModel malayalamNaturalRows];
+    const bool naturalHindi = [iTermAdvancedSettingsModel hindiNaturalRows];
 
     // Get direct access to UTF-16 buffer for fast scanning.
     const UniChar *chars = CFStringGetCharactersPtr((CFStringRef)self);
@@ -1824,6 +1826,16 @@ static TECObjectRef CreateTECConverterForUTF8Variants(TextEncodingVariant varian
                                                                       range.location + 1,
                                                                       range.length - 1,
                                                                       aggressive);
+            // Keep enabled-script marks attached, but split consonants and cell-width Hindi visarga.
+            while ((naturalMalayalam || naturalHindi) && exceptionIdx != kCFNotFound &&
+                   iTermIsNaturalRowCodePoint(chars[exceptionIdx], naturalMalayalam, naturalHindi) &&
+                   chars[exceptionIdx] != 0x0903 &&
+                   iTermIsSpacingCombiningMark(chars[exceptionIdx])) {
+                const CFIndex next = exceptionIdx + 1;
+                exceptionIdx = iTermFindFirstCodePointWithOwnCell(chars, next,
+                                                                 NSMaxRange(range) - next,
+                                                                 aggressive);
+            }
             if (exceptionIdx != kCFNotFound) {
                 const BOOL precededByZWJ = (exceptionIdx > 0 &&
                                             chars[exceptionIdx - 1] == 0x200d);

@@ -22,7 +22,11 @@ class AITermControllerObjC: NSObject, AITermControllerDelegate, iTermObject {
     // Keys stored for a single manual model (AIModelCredential.modelKey), by
     // configuration ID.
     private static var cachedModelKeys = [String: CachedKey]()
+#if LIPI_TERMINAL
+    private static let keychainService = "io.github.cshintov.lipi-terminal.api-keys"
+#else
     private static let keychainService = "iTerm2 API Keys"
+#endif
     private static let legacyKeychainAccount = "OpenAI API Key for iTerm2"
 
     @objc static var haveCachedAPIKey: Bool {

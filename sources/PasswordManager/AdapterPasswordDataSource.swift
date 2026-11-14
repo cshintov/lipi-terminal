@@ -452,7 +452,11 @@ class AdapterPasswordDataSource: CommandLinePasswordDataSource {
     // MARK: - Credential Persistence
 
     private var keychainCredentialServiceName: String {
+#if LIPI_TERMINAL
+        "io.github.cshintov.lipi-terminal.adapter-\(identifier)"
+#else
         "iTerm2-Adapter-\(identifier)"
+#endif
     }
 
     @discardableResult

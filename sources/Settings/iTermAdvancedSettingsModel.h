@@ -419,6 +419,14 @@ extern NSString *const iTermAdvancedSettingsDidChange;
 + (int)asyncPreconvertMaxOutstandingBytes;
 + (BOOL)logNonASCIIStringLengthHistogram;
 + (BOOL)preferSpeedToFullLigatureSupport;
++ (BOOL)malayalamNaturalRows;
++ (BOOL)hindiNaturalRows;
++ (NSString *)hindiNaturalRowsFont;
+// Derived renderer gate, not a separate preference.
++ (BOOL)naturalRows;
++ (BOOL)malayalamCellStrip;
++ (BOOL)malayalamVisualWrap;
++ (BOOL)malayalamParagraphFlow;
 + (BOOL)enableContextualAlternates;
 + (BOOL)preserveFontSizeOnAutomaticProfileSwitch;
 + (NSString *)preferredBaseDir;

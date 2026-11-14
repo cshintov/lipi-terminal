@@ -16,6 +16,7 @@
 #import "iTermExternalAttributeIndex.h"
 #import "iTermColorMap.h"
 #import "iTermMutableAttributedStringBuilder.h"
+#import "ScreenCharArray.h"
 
 #define likely(x) __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
@@ -87,6 +88,8 @@ NSString *const iTermImageLineAttribute = @"iTermImageLineAttribute";
 NSString *const iTermImageDisplayColumnAttribute = @"iTermImageDisplayColumnAttribute";
 NSString *const iTermIsBoxDrawingAttribute = @"iTermIsBoxDrawingAttribute";
 NSString *const iTermUnderlineLengthAttribute = @"iTermUnderlineLengthAttribute";
+NSString *const iTermMalayalamUnderlineAttribute = @"iTermMalayalamUnderlineAttribute";
+NSString *const iTermMalayalamSourceBackgroundsAttribute = @"iTermMalayalamSourceBackgroundsAttribute";
 NSString *const iTermHasUnderlineColorAttribute = @"iTermHasUnderlineColorAttribute";
 NSString *const iTermUnderlineColorAttribute = @"iTermUnderlineColorAttribute";  // @[r,g,b,mode]
 NSString *const iTermKittyImageRowAttribute = @"iTermKittyImageRowAttribute";
@@ -328,8 +331,25 @@ enum {
     kDictCacheMinHitRateDivisor = 4,
 };
 
+// Inspect canonical Latin accents without normalizing the text stored or drawn.
+static BOOL iTermNaturalRowAccentedLatinCell(NSString *source) {
+    NSString *decomposed = source.decomposedStringWithCanonicalMapping;
+    if (decomposed.length < 2) { return NO; }
+    const unichar base = [decomposed characterAtIndex:0];
+    if (!((base >= 'A' && base <= 'Z') || (base >= 'a' && base <= 'z'))) { return NO; }
+    for (NSUInteger i = 1; i < decomposed.length; i++) {
+        const unichar mark = [decomposed characterAtIndex:i];
+        // Combining Diacritical Marks only, excluding the invisible grapheme joiner.
+        if (mark < 0x0300 || mark > 0x036f || mark == 0x034f) { return NO; }
+    }
+    return YES;
+}
+
 @implementation iTermAttributedStringBuilder {
     int _statsCount;
+    NSString *_hindiFontName;
+    CGFloat _hindiFontSize;
+    PTYFontInfo *_hindiFont;
     // Interns -dictionaryForCharacterAttributes: results across runs and frames.
     // The builder is used serially (one per Metal per-frame state; rows built in
     // order), so no locking is needed. Bounded to avoid unbounded growth on
@@ -339,6 +359,33 @@ enum {
     NSInteger _dictCacheLookups;
     NSInteger _dictCacheHits;
     BOOL _dictCacheDisabled;  // Set when the hit rate is too low to be worth the overhead.
+}
+
+// Resolve the family and its traits once per requested name/size, including missing names.
+- (PTYFontInfo *)hindiFontWithName:(NSString *)name size:(CGFloat)size {
+    if (size == _hindiFontSize && [name isEqualToString:_hindiFontName]) { return _hindiFont; }
+    _hindiFontName = [name copy];
+    _hindiFontSize = size;
+    _hindiFont = nil;
+    NSFont *font = [NSFont fontWithName:name size:size];
+    if (!font) { return nil; }
+    _hindiFont = [PTYFontInfo fontInfoWithFont:font];
+    _hindiFont.boldVersion = [_hindiFont computedBoldVersion];
+    // Cache the same shear used below, so Hindi italic cells do not create a font per cell.
+    for (PTYFontInfo *base in @[_hindiFont, _hindiFont.boldVersion ?: _hindiFont]) {
+        if (base.italicVersion) { continue; }
+        base.italicVersion = (CTFontGetSymbolicTraits((__bridge CTFontRef)base.font) & kCTFontTraitItalic) ?
+            [PTYFontInfo fontInfoWithFont:base.font] : [base computedItalicVersion];
+        if (!base.italicVersion) {
+            CGAffineTransform matrix = CGAffineTransformConcat(CTFontGetMatrix((__bridge CTFontRef)base.font),
+                                                                CGAffineTransformMake(1, 0, 0.2, 1, 0, 0));
+            NSFont *italic = CFBridgingRelease(CTFontCreateCopyWithAttributes((__bridge CTFontRef)base.font,
+                                                                           0, &matrix, NULL));
+            if (italic) { base.italicVersion = [PTYFontInfo fontInfoWithFont:italic]; }
+        }
+    }
+    _hindiFont.boldItalicVersion = _hindiFont.boldVersion.italicVersion;
+    return _hindiFont;
 }
 
 - (instancetype)initWithStats:(iTermAttributedStringBuilderStatsPointers)stats {
@@ -1266,6 +1313,275 @@ withExtendedAttributes:(iTermExternalAttribute *)ea2 {
     _fontProvider = [other.fontProvider cloneFontProvider];
     _fontTable = other.fontTable;
     _delegate = delegate;
+}
+
+- (iTermMalayalamRowLayout *)malayalamLayoutForRow:(ScreenCharArray *)row
+                                   expectedWidth:(int)expectedWidth
+                                  backgroundRuns:(NSArray<iTermBoxedBackgroundColorRun *> *)backgroundRuns
+                                     findMatches:(NSData *)findMatches
+                                  previousLayout:(iTermMalayalamRowLayout *)previousLayout
+                                          reason:(NSString **)reason {
+    return [self malayalamLayoutForRow:row expectedWidth:expectedWidth backgroundRuns:backgroundRuns
+        findMatches:findMatches previousLayout:previousLayout reason:reason allowASCIITable:NO];
+}
+
+- (iTermMalayalamRowLayout *)malayalamLayoutForRow:(ScreenCharArray *)row
+                                   expectedWidth:(int)expectedWidth
+                                  backgroundRuns:(NSArray<iTermBoxedBackgroundColorRun *> *)backgroundRuns
+                                     findMatches:(NSData *)findMatches
+                                  previousLayout:(iTermMalayalamRowLayout *)previousLayout
+                                          reason:(NSString **)reason
+                                  allowASCIITable:(BOOL)allowASCIITable {
+    _malayalamRowLayoutPreparationCount++;
+    // Localization unneeded: stable opt-in diagnostic identifiers, not UI text.
+    if (reason) { *reason = @"no-Malayalam"; }
+    if (!row || expectedWidth <= 0 || row.length != expectedWidth) {
+        if (reason) { *reason = @"row-width-mismatch"; }
+        return nil;
+    }
+    if (_reverseVideo) {
+        if (reason) { *reason = @"invalid-row-or-reverse-video"; }
+        return nil;
+    }
+    const screen_char_t *line = row.line;
+    const int width = row.length;
+    id<iTermExternalAttributeIndexReading> eaIndex = row.eaIndex;
+    // Keep full source spans, including unshaped history padding, in the layout identity.
+    NSMutableArray<NSArray<NSNumber *> *> *backgrounds = [NSMutableArray array];
+    int backgroundStart = 0;
+    screen_char_t previousBackground = line[0];
+    if (previousBackground.backgroundColorMode == ColorModeAlternate || previousBackground.backgroundColorMode == ColorModeNormal) {
+        previousBackground.bgGreen = previousBackground.bgBlue = 0;
+    }
+    if (previousBackground.backgroundColorMode == ColorModeAlternate &&
+        previousBackground.backgroundColor == ALTSEM_REVERSED_DEFAULT) {
+        previousBackground.backgroundColor = ALTSEM_DEFAULT;
+    }
+    for (int column = 1; column <= width; column++) {
+        screen_char_t cell = column < width ? line[column] : previousBackground;
+        if (cell.backgroundColorMode == ColorModeAlternate || cell.backgroundColorMode == ColorModeNormal) {
+            cell.bgGreen = cell.bgBlue = 0;  // These modes use only the color index.
+        }
+        if (cell.backgroundColorMode == ColorModeAlternate && cell.backgroundColor == ALTSEM_REVERSED_DEFAULT) {
+            cell.backgroundColor = ALTSEM_DEFAULT;  // Cursor reversal remains an independent overlay.
+        }
+        if (column == width || cell.backgroundColorMode != previousBackground.backgroundColorMode ||
+            cell.backgroundColor != previousBackground.backgroundColor || cell.bgGreen != previousBackground.bgGreen ||
+            cell.bgBlue != previousBackground.bgBlue) {
+            [backgrounds addObject:@[@(backgroundStart), @(column - backgroundStart),
+                @(previousBackground.backgroundColorMode), @(previousBackground.backgroundColor),
+                @(previousBackground.bgGreen), @(previousBackground.bgBlue)]];
+            backgroundStart = column;
+            previousBackground = cell;
+        }
+    }
+    int contentEnd = width;
+    while (contentEnd > 0 && !line[contentEnd - 1].complexChar &&
+           !line[contentEnd - 1].image && line[contentEnd - 1].code == 0) {
+        contentEnd--;
+    }
+    NSMutableAttributedString *text = [[NSMutableAttributedString alloc] init];
+    NSMutableArray<NSNumber *> *boundaries = [NSMutableArray arrayWithObject:@0];
+    const BOOL malayalamEnabled = [iTermAdvancedSettingsModel malayalamNaturalRows];
+    const BOOL hindiEnabled = [iTermAdvancedSettingsModel hindiNaturalRows];
+    NSString *hindiFontName = hindiEnabled ? [iTermAdvancedSettingsModel hindiNaturalRowsFont] : @"";
+    BOOL foundNaturalScript = NO;
+    static NSCharacterSet *commonCharacters;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSMutableCharacterSet *characters = [[NSCharacterSet punctuationCharacterSet] mutableCopy];
+        [characters formUnionWithCharacterSet:[NSCharacterSet symbolCharacterSet]];
+        [characters formUnionWithCharacterSet:[NSCharacterSet whitespaceCharacterSet]];
+        [characters formIntersectionWithCharacterSet:[[NSCharacterSet controlCharacterSet] invertedSet]];
+        [characters formIntersectionWithCharacterSet:[[NSCharacterSet newlineCharacterSet] invertedSet]];
+        commonCharacters = [characters copy];
+    });
+    for (int column = 0; column < width; column++) {
+        screen_char_t c = line[column];
+        iTermExternalAttribute *ea = eaIndex[column];
+        const BOOL defaultBackground = c.backgroundColorMode == ColorModeAlternate &&
+            (c.backgroundColor == ALTSEM_DEFAULT || c.backgroundColor == ALTSEM_REVERSED_DEFAULT);
+        // Unsupported presentation must stay on the original renderer with visible status.
+        if (c.image || c.blink || c.invisible ||
+            (c.underline && ScreenCharGetUnderlineStyle(c) != VT100UnderlineStyleSingle) ||
+            c.strikethrough || ea.controlCode.valid || ea.url ||
+            (!defaultBackground && c.backgroundColorMode != ColorModeNormal &&
+             c.backgroundColorMode != ColorMode24bit)) {
+            if (reason) { *reason = @"unsupported-presentation-or-background"; }
+            return nil;
+        }
+        NSString *source;
+        if (column >= contentEnd || ScreenCharIsDWC_RIGHT(c) || ScreenCharIsDWL_SPACER(c)) {
+            source = @"";
+        } else if (!c.complexChar && c.code == 0) {
+            source = @" ";
+        } else {
+            source = ScreenCharToStr(&c) ?: @"";
+        }
+        BOOL containsHindi = NO;
+        UTF32Char previousScalar = 0;
+        UTF32Char beforePreviousScalar = 0;
+        for (NSUInteger i = 0; i < source.length;) {
+            const unichar first = [source characterAtIndex:i];
+            const BOOL high = CFStringIsSurrogateHighCharacter(first);
+            if (CFStringIsSurrogateLowCharacter(first) ||
+                (high && (i + 1 >= source.length ||
+                          !CFStringIsSurrogateLowCharacter([source characterAtIndex:i + 1])))) {
+                if (reason) { *reason = @"invalid-utf16"; }
+                return nil;
+            }
+            const UTF32Char scalar = [source longCharacterAtIndex:i];
+            containsHindi |= iTermIsNaturalRowCodePoint(scalar, NO, hindiEnabled);
+            i += high ? 2 : 1;
+            const BOOL emojiSelector = (scalar == 0xfe0e || scalar == 0xfe0f) &&
+                iTermIsEmojiAcceptingVS16(previousScalar);
+            const UTF32Char keycapBase = previousScalar == 0xfe0f ? beforePreviousScalar : previousScalar;
+            const BOOL keycap = scalar == 0x20e3 &&
+                (keycapBase == '#' || keycapBase == '*' || (keycapBase >= '0' && keycapBase <= '9'));
+            if (iTermIsNaturalRowCodePoint(scalar, malayalamEnabled, hindiEnabled)) {
+                foundNaturalScript = YES;
+            } else if ((scalar < 32 || scalar > 126) &&
+                       scalar != 0x200c && scalar != 0x200d && !emojiSelector && !keycap &&
+                       ![commonCharacters longCharacterIsMember:scalar] &&
+                       !iTermNaturalRowAccentedLatinCell(source)) {
+                // Keep the existing symbol/punctuation/space policy, not arbitrary supplementary scripts.
+                if (reason) { *reason = @"unsupported-script-or-control"; }
+                return nil;
+            }
+            beforePreviousScalar = previousScalar;
+            previousScalar = scalar;
+        }
+        if (source.length) {
+            BOOL fakeBold = c.bold;
+            BOOL fakeItalic = c.italic;
+            UTF32Char remapped = 0;
+            PTYFontInfo *font = [_fontProvider fontForCharacter:[source longCharacterAtIndex:0]
+                                                  useBoldFont:_boldAllowed
+                                                useItalicFont:_italicAllowed
+                                                   renderBold:&fakeBold
+                                                 renderItalic:&fakeItalic
+                                                     remapped:&remapped];
+            if (!font.font || remapped) {
+                if (reason) { *reason = @"font-color-or-remapping"; }
+                return nil;
+            }
+            if (containsHindi && hindiFontName.length) {
+                PTYFontInfo *hindiFont = [self hindiFontWithName:hindiFontName size:font.font.pointSize];
+                if (hindiFont) {
+                    fakeBold = c.bold;
+                    fakeItalic = c.italic;
+                    font = [PTYFontInfo fontForAsciiCharacter:NO asciiFont:hindiFont nonAsciiFont:hindiFont
+                                                 useBoldFont:_boldAllowed useItalicFont:_italicAllowed
+                                            usesNonAsciiFont:YES renderBold:&fakeBold renderItalic:&fakeItalic];
+                    if (CTFontGetSymbolicTraits((__bridge CTFontRef)font.font) & kCTFontTraitBold) { fakeBold = NO; }
+                }
+            }
+            NSFont *renderFont = font.font;
+            if (fakeItalic) {
+                // Put synthesis in the font so shaping, caret geometry and ink use the same matrix.
+                CGAffineTransform matrix = CGAffineTransformConcat(CTFontGetMatrix((__bridge CTFontRef)renderFont),
+                                                                    CGAffineTransformMake(1, 0, 0.2, 1, 0, 0));
+                renderFont = CFBridgingRelease(CTFontCreateCopyWithAttributes((__bridge CTFontRef)renderFont,
+                                                                             0, &matrix, NULL));
+                if (!renderFont) {
+                    if (reason) { *reason = @"italic-font-creation"; }
+                    return nil;
+                }
+            }
+            NSMutableDictionary *attributes = [@{
+                NSFontAttributeName: renderFont,
+                (NSString *)kCTLigatureAttributeName: @1,
+                iTermBoldAttribute: @(c.bold),
+                iTermFakeBoldAttribute: @(fakeBold)
+            } mutableCopy];
+            if (c.underline) {
+                attributes[iTermMalayalamUnderlineAttribute] = @YES;
+                attributes[iTermHasUnderlineColorAttribute] = @(ea.hasUnderlineColor);
+                if (ea.hasUnderlineColor) {
+                    VT100TerminalColorValue color = ea.underlineColor;
+                    attributes[iTermUnderlineColorAttribute] = @[@(color.red), @(color.green), @(color.blue), @(color.mode)];
+                }
+            }
+            [text appendAttributedString:[[NSAttributedString alloc] initWithString:source attributes:attributes]];
+        }
+        [boundaries addObject:@(text.length)];
+    }
+    if (text.length) {
+        // One identical metadata value across the text does not introduce shaping boundaries.
+        [text addAttribute:iTermMalayalamSourceBackgroundsAttribute value:[backgrounds copy]
+                     range:NSMakeRange(0, text.length)];
+    }
+    NSMutableIndexSet *selected = [NSMutableIndexSet indexSet];
+    for (iTermBoxedBackgroundColorRun *box in backgroundRuns) {
+        const iTermBackgroundColorRun *run = box.valuePointer;
+        if (run->modelRange.location > width || run->modelRange.length > width - run->modelRange.location) {
+            if (reason) { *reason = @"background-run-range"; }
+            return nil;
+        }
+        if (run->selected) { [selected addIndexesInRange:run->modelRange]; }
+    }
+    iTermMalayalamRowLayout *selectionGeometry = nil;
+    NSIndexSet *filledSelection = [NSIndexSet indexSet];
+    if (selected.count && (foundNaturalScript || allowASCIITable)) {
+        _malayalamRowLayoutBuildCount++;
+        selectionGeometry = [[iTermMalayalamRowLayout alloc] initWithAttributedString:text
+                                                                cellUTF16Boundaries:boundaries];
+        if (!selectionGeometry) {
+            if (reason) { *reason = @"selection-geometry"; }
+            return nil;
+        }
+        filledSelection = [selectionGeometry wholeSelectedColumns:selected];
+    }
+    // Selected foreground follows native spans; its final shape is checked below.
+    for (iTermBoxedBackgroundColorRun *box in backgroundRuns) {
+        iTermBackgroundColorRun run = *box.valuePointer;
+        run.selected = [filledSelection containsIndexesInRange:run.modelRange];
+        iTermTextColorContext context = {
+            .dimmingAmount = _colorMap.dimmingAmount,
+            .mutingAmount = _colorMap.mutingAmount,
+            .hasSelectedText = run.selected,
+            .colorMap = _colorMap,
+            .delegate = _delegate,
+            .findMatches = findMatches,
+            .reverseVideo = _reverseVideo,
+            .backgroundColor = [_delegate unprocessedColorForBackgroundRun:&run enableBlending:YES],
+            .minimumContrast = _minimumContrast,
+        };
+        BOOL previousContrastIneligible = NO;
+        for (NSUInteger column = run.modelRange.location; column < NSMaxRange(run.modelRange); column++) {
+            const NSRange source = NSMakeRange(boundaries[column].unsignedIntegerValue,
+                boundaries[column + 1].unsignedIntegerValue - boundaries[column].unsignedIntegerValue);
+            if (!source.length) { continue; }
+            screen_char_t c = line[column];
+            const BOOL contrastIneligible = !c.complexChar &&
+                [[iTermBoxDrawingBezierCurveFactory blockDrawingCharacters] characterIsMember:c.code];
+            if (contrastIneligible != previousContrastIneligible) {
+                context.havePreviousCharacterAttributes = NO;
+            }
+            previousContrastIneligible = contrastIneligible;
+            NSColor *color = iTermTextDrawingHelperGetTextColor(&c, eaIndex[column], NO, (int)column,
+                                                               &context, &run, contrastIneligible);
+            if (!color) {
+                if (reason) { *reason = @"font-color-or-remapping"; }
+                return nil;
+            }
+            [text addAttribute:(NSString *)kCTForegroundColorAttributeName value:(id)color.CGColor range:source];
+        }
+    }
+    if (foundNaturalScript && reason) { *reason = @"natural"; }
+    if (!foundNaturalScript && !allowASCIITable) { return nil; }
+    iTermMalayalamRowLayout *layout = previousLayout;
+    if (![previousLayout.attributedString isEqualToAttributedString:text] ||
+        ![previousLayout.cellUTF16Boundaries isEqualToArray:boundaries]) {
+        _malayalamRowLayoutBuildCount++;
+        layout = [[iTermMalayalamRowLayout alloc] initWithAttributedString:text
+                                                   cellUTF16Boundaries:boundaries];
+    }
+    if (selectionGeometry && (!layout || ![selectionGeometry hasEquivalentGeometryTo:layout])) {
+        if (reason) { *reason = @"selection-shape-changed"; }
+        return nil;
+    }
+    return layout;
 }
 
 - (NSString *)statisticsString {

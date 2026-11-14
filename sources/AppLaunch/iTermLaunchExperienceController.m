@@ -114,7 +114,13 @@ typedef NS_ENUM(NSUInteger, iTermLaunchExperienceChoice) {
             return self;
         }
         const NSInteger runCount = [iTermLaunchExperienceController incrementRunCount];
-        if (runCount == 2 && ![[SUUpdater sharedUpdater] automaticallyChecksForUpdates]) {
+#if LIPI_TERMINAL
+        const BOOL updaterWillPrompt = NO;
+        (void)runCount;
+#else
+        const BOOL updaterWillPrompt = runCount == 2 && ![[SUUpdater sharedUpdater] automaticallyChecksForUpdates];
+#endif
+        if (updaterWillPrompt) {
             // Sparkle will do its thing this launch.
             _choice = iTermLaunchExperienceChoiceNone;
         } else if ([iTermLaunchExperienceController quelled]) {

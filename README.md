@@ -1,209 +1,145 @@
-<div align="center">
+# Lipi Terminal
 
-# iTerm2
+<img src="Resources/lipi/logo.png" width="128" height="128" alt="Lipi Terminal logo">
 
-### macOS Terminal Replacement
+An experimental macOS terminal fork of [iTerm2](https://iterm2.com), focused on
+naturally shaped Malayalam and Hindi text. Core Text supplies shaping; Lipi keeps
+terminal cells and copied source text while projecting text into native glyph
+geometry. It does not squeeze each letter into an equal-width box.
 
-![Version](https://img.shields.io/badge/version-3.6-blue.svg)
-![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
+Lipi is not an official iTerm2 release. Its natural-text options are **off by
+default**. General compatibility, physical-input correctness and acceptable
+performance in every terminal application are not established.
 
-**[Website](https://iterm2.com)** • **[Downloads](https://iterm2.com/downloads.html)** • **[Documentation](https://iterm2.com/documentation.html)** • **[Features](https://iterm2.com/features.html)**
+## Enable natural text
 
-</div>
+In **Settings > Advanced**, search for the setting names below. Start a new
+session after changing a natural-row option.
 
----
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `MalayalamNaturalRows` | Off | Natural Malayalam text and native caret geometry. |
+| `HindiNaturalRows` | Off | Independent opt-in for natural Devanagari text. |
+| `HindiNaturalRowsFont` | `DevanagariSangamMN` | Hindi-only font override. Empty means Automatic; an unavailable font uses the existing fallback. |
+| `MalayalamVisualWrap` | Off | Experimental visual wrapping, including enabled Hindi rows. |
+| `MalayalamParagraphFlow` | Off | Heuristic joining of likely client-painted prose continuations. |
 
-## About
+Natural rows use the **legacy renderer**, not Metal. The Hindi font override
+keeps the profile's point size and does not change its ASCII or Malayalam font.
+Choose an installed Malayalam-capable non-ASCII profile font for Malayalam.
+Fonts can change wrapping and caret geometry, so compare actual text before
+adopting a different face. The exact-cell inspection strip is a separate,
+development-only option and is off by default.
 
-iTerm2 is a powerful terminal emulator for macOS that brings the terminal into the modern age with features you never knew you always wanted.
+Some setting and class names retain “Malayalam” for compatibility even where
+Hindi uses the same path. The two script switches remain independent. Enabling
+natural rows affects supported attached-mark cell ownership for newly received
+text; changing a font cannot recover text already overwritten by an earlier
+client redraw.
 
-### Key Features
+## What has been checked
 
-- **tmux Integration** - Native iTerm2 windows/tabs replace tmux's text-based interface. Run tmux -CC and tmux windows become real macOS windows. Sessions persist through crashes, SSH disconnects, and even app upgrades. Collaborate by having two people attach to the same session.
-- **Shell Integration** - Deep shell awareness that tracks commands, directories, hostnames, and usernames. Enables click-to-download files via SCP, drag-and-drop uploads, command history per host, recent directories by "frecency," and marks at each prompt.
-- **AI Chat** - Built-in LLM chat window that can optionally interact with terminal contents. Link sessions to get context-aware help, run commands on your behalf, or explain output with annotations.
-- **Inline Images** - Display images (including animated GIFs) directly in the terminal. Use imgcat to view photos, charts, or visual output without leaving your workflow.
-- **Automatic Profile Switching** - Terminal appearance changes automatically based on hostname, username, directory, or running command. SSH to production? Background turns red. Different environments get different visual contexts.
-- **Dedicated Hotkey Windows** - System-wide hotkey summons a terminal that slides down from the top of the screen (or any edge), even over fullscreen apps. Pin it or let it auto-hide.
-- **Session Restoration** - Sessions run in long-lived server processes. If iTerm2 crashes or upgrades, your shells keep running. When iTerm2 restarts, it reconnects to your sessions exactly where you left off.
-- **Built-in Web Browser** - Browser profiles integrate web browsing into iTerm2's window/tab/pane hierarchy. Copy mode, triggers, AI chat, and other terminal features work in browser sessions.
-- **Configurable Status Bar** - Per-session status bar showing git branch, CPU/memory graphs, current directory, hostname, custom interpolated strings, or Python API components.
-- **Triggers** - Regex patterns that fire actions when matched: highlight text, run commands, send notifications, open password manager, set marks, or invoke Python scripts.
-- **Smart Selection** - Quad-click selects semantic objects (URLs, file paths, email addresses, quoted strings). Right-click for context actions. Cmd-click to open.
-- **Copy Mode** - Vim-like keyboard selection. Navigate and select text without touching the mouse. Works with marks to jump between command prompts.
-- **Instant Replay** - Scrub backward through terminal history to see exactly what was on screen at any moment, with timestamps. Perfect for catching fleeting errors.
-- **Python Scripting API** - Full automation and customization via Python. Create custom status bar components, triggers, menu items, or entirely new features.
-- **Open Quickly** - Cmd-Shift-O opens a search across all sessions by tab title, command, hostname, directory, or badge. Navigate large session collections instantly.
+Integrated native tests exercise parser cells, captured positional terminal
+updates, natural shaping, wrapping, selection/copy, font fallback and changes,
+scrolling, and client mouse-report routing. Claude Code has been used for live
+checks and captured-output replay. Tests and offscreen images are evidence for
+those cases, not a guarantee for every reply or client version.
 
----
+Codex/tmux rendering is **not yet optimal**: unwanted gaps and broken words have
+been reported and remain a known compatibility issue. Claude Code results do
+not establish Codex support.
 
-## Installation
+## Known limits
 
-### Download
+- Unsupported row content or screen topology can retain the ordinary grid
+  fallback. Failed table preparation is a separate shared-geometry exception.
+- Paragraph joining is intentionally conservative. It must preserve headings,
+  blank lines, list boundaries and original source coordinates.
+- Natural wrapping changes presentation, not the coordinates a terminal client
+  sends. Full-screen applications can impose incompatible layout assumptions.
+- Responsive Unicode box tables have bounded coverage, not universal TUI support.
+- Local text selection uses native cluster edges. Client mouse reports and
+  keyboard movement still need exact logical cells. Successful protocol replay
+  alone is not physical mouse or trackpad acceptance.
+- Some redraw artifacts remain under investigation; clean replays do not
+  establish every live redraw.
+- No universal Unicode, arbitrary-font, accessibility or no-lag claim is made.
 
-Get the latest version from [iterm2.com/downloads](https://iterm2.com/downloads.html)
+## Build and isolation
 
-For the bleeding edge without building, try the [nightly build](https://iterm2.com/nightly/latest).
-
-### Build from Source
-
-> **Note:** Development builds may be less stable than official releases.
-
-#### Prerequisites
-
-- No manual prerequisites. `make setup` will install [Homebrew](https://brew.sh/), Xcode,
-  Rust, and all other dependencies, prompting for confirmation before each privileged step.
-
-#### Clone
-
-```bash
-git clone https://github.com/gnachman/iTerm2.git
-```
-
-#### Setup (first time)
-
-```bash
-make setup
-```
-
-`make setup` is interactive and will prompt for confirmation before any privileged or
-security-sensitive operation. It performs the following steps:
-
-- **Homebrew** -- Installs [Homebrew](https://brew.sh/) via its official install script
-  if not already present. Prompts before running the installer (which requires sudo).
-- **Xcode** -- If no Xcode is selected via `xcode-select`, installs
-  [xcodes](https://github.com/XcodesOrg/xcodes) (via Homebrew) and
-  [aria2](https://aria2.github.io/) (for faster downloads), then either selects an
-  existing `/Applications/Xcode*.app` or downloads the latest Xcode automatically.
-  Prompts before running `sudo xcode-select` and before accepting the Xcode license.
-- **Rust** -- Installs [rustup](https://rustup.rs) via the official `curl | sh`
-  installer if not already present. Prompts before executing the script.
-- **Homebrew packages** -- Installs cmake, pkg-config, automake, perl, and python3 if
-  missing. If `brew link python@3` would overwrite existing symlinks, prompts for
-  confirmation before proceeding.
-- **SF Symbols** -- Installs the SF Symbols cask (a `.pkg` installer that requires
-  sudo). Prompts before attempting the install; continues without it if declined.
-- **Python/Rust packages** -- Installs pyobjc (via pip) and cbindgen (via cargo) if not
-  already present.
-- **Submodules and toolchains** -- Initializes git submodules, adds the x86_64 Rust
-  target, and downloads the Metal toolchain.
-
-To skip all confirmation prompts, use `make dangerous-setup` instead.
-
-After setup, compile native dependencies and build:
+Use the fork-specific entry point with full Xcode, a clean committed checkout
+and the project's dependencies already prepared. The builder exports exact HEAD,
+not uncommitted edits. The output must be a new or empty directory outside the
+checkout. Supply an existing Xcode SourcePackages directory with workspace state
+and clean checkouts at the exact Package.resolved revisions. For example, using
+prepared sibling directories:
 
 ```bash
-make paranoid-deps   # compile OpenSSL, libsixel, libgit2, Sparkle, etc. (sandboxed)
-make                 # build iTerm2
+tools/build-lipi.sh \
+  --output ../lipi-output \
+  --source-packages ../existing-source-packages-cache
 ```
 
-Re-run `make paranoid-deps` whenever your active Xcode version changes -- the file `last-xcode-version` tracks which version was last used.
+The result is `../lipi-output/Lipi Terminal.app`. Use `--developer-dir` to select an
+Xcode Developer directory for this build without changing global selection.
+The script does not install prerequisites or download dependencies. Use populated
+pinned submodules. If absent, provide existing pinned checkouts through
+`--noise-source` and `--shell-integration-source`. These are source inputs, not
+download locations. Upstream dependency/setup documentation remains in the
+repository; review it before allowing installations or privileged changes.
 
-If your Xcode version differs from the one committed in `last-xcode-version` (e.g. you're on an older machine), suppress the noise without committing your local version:
+The builder exports the committed source and privately copies the package cache
+into the output directory. It validates pinned revisions before building an
+unsigned, host-architecture Development app with optimization and assertions.
+The output also contains `build.log`, `build-receipt.json` and `app-manifest.json`.
+It does not install or launch the app, fetch dependencies, use signing credentials,
+or write global settings. That is a build-script boundary, not a claim that the
+running terminal has no network features or shared services. The Lipi package
+uses its own app icon; upstream app-icon artwork is not used for the Lipi icon.
 
-```bash
-git update-index --skip-worktree last-xcode-version
-```
+Lipi uses the separate bundle identifier `io.github.cshintov.lipi-terminal` and
+its own preferences identity. The Lipi package removes the upstream automatic
+update feed and key; there is no Lipi update service. Internal executable and
+helper names may still say iTerm2. Do not replace a working iTerm2 app, import its
+preferences over an existing setup, or infer complete isolation of every
+upstream service from the different app name.
 
-To undo: `git update-index --no-skip-worktree last-xcode-version`
+### Upstream network paths
 
-#### Build
+The following upstream product paths remain in the source. App replacement
+updates and upstream crash submission are disabled in a Lipi build. Other rows
+describe the existing feature gates, not features exercised by the build script.
 
-```bash
-make Development
-```
+| Feature | Upstream destination | Trigger or Lipi behavior |
+| --- | --- | --- |
+| App replacement | `iterm2.com/appcasts/*` | Disabled in Lipi, including manual checks; feed/key removed. |
+| Crash submission | `iterm2.com/crashreportform.php` | Upstream crash reporting is disabled in Lipi. |
+| AI model catalog | `iterm2.com/downloads/ai/manifest.json` | Automatic updates default off and require AI enablement/consent; manual catalog update exists. This is model data, not app replacement. |
+| Python and uv provisioning | `iterm2.com/downloads/pyenv/{manifest,manifest-new,betamanifest}.json`, `iterm2.com/downloads/uv/manifest.json` | Runtime provisioning and rate-limited/user-requested update checks. Manifests can lead to executable runtime/package downloads. |
+| AI and Companion plugins | `iterm2.com/downloads/ai-plugin/iTermAI-1.1.zip`, `iterm2.com/downloads/companion-plugin/iTermCompanion-1.0.zip` | Explicit optional feature installation downloads executable plugins. |
+| Nerd Fonts | `iterm2.com/downloads/assets/nerd-fonts-v2.zip` | Explicit font installation asks for download permission. |
+| Shell integration | `iterm2.com/shell_integration/v2/install_shell_integration.sh`, `iterm2.com/shell_integration/v2/install_shell_integration_and_utilities.sh` | Explicit download-and-run installation. It can intentionally modify shell integration files and shell startup configuration, not just Lipi preferences. |
+| Companion connections | `relay.iterm2.com`, `resolver.iterm2.com/shardmap.json`, `push.iterm2.com`, `push2.iterm2.com` | Companion pairing, connection routing and notifications; separate from the app updater. |
+| Browser help/support | `iterm2.com` documentation, bugs, credits, color gallery and feature-help pages | User-opened Help, tips and feature links retain upstream documentation. Report fork-specific defects to this repository. |
+| API protocol name | `api.iterm2.com` | A WebSocket subprotocol identifier, not a network destination. |
 
-#### Run
+This is the reviewed source-level upstream product inventory, not a full traffic
+audit. User-configured AI providers, browsers, third-party frameworks and
+installed plugins can contact other services. Disabling app updates does not
+make the running application offline or isolate every optional feature's writes.
 
-```bash
-make run
-```
+No published Lipi binary or clean-clone build result is claimed here. Public
+release readiness requires the exact sanitized branch, native regression checks,
+identity review and a successful clean-clone build.
 
-#### Architecture
+## Upstream and license
 
-Builds target your native architecture by default. To produce a universal (arm64 + x86_64) binary:
+Lipi is based on iTerm2 by George Nachman and its contributors. For general
+upstream documentation, see [iTerm2 documentation](https://iterm2.com/documentation.html).
+Fork-specific rendering problems should be reported to this repository, not
+presented as bugs in an unmodified upstream installation.
 
-```bash
-UNIVERSAL=1 make Development
-```
-
-#### Code signing
-
-Code signing is disabled by default to keep contributor builds simple. To enable it with the project's signing identity:
-
-```bash
-SIGNED=1 make Development
-```
-
-#### Building in Xcode
-
-If you prefer building from Xcode instead of the command line:
-
-1. Complete the **Clone** and **Setup** steps above.
-2. Configure code signing with your team ID:
-
-   ```bash
-   tools/set_team_id.sh YOUR_TEAM_ID
-   ```
-
-   This script updates `DEVELOPMENT_TEAM` in all Xcode project files (iTerm2 and its dependencies like Sparkle, SwiftyMarkdown, etc.) so code signing works with your identity.
-
-   **To find your team ID:** Open Keychain Access, find your "Apple Development" or "Developer ID" certificate, and look for the 10-character string in parentheses (e.g., "H7V7XYVQ7D").
-
-   **No Developer account?** Skip this step and select "Sign to Run Locally" in Xcode's Signing & Capabilities tab.
-
-3. Open `iTerm2.xcodeproj` in Xcode.
-4. Edit Scheme (Cmd-<) and set Build Configuration to **Development**.
-5. Press Cmd-R to build and run.
-
----
-
-## Development
-
-### Contributing
-
-We welcome contributions! Please read our [contribution guide](https://gitlab.com/gnachman/iterm2/-/wikis/How-to-Contribute) before submitting pull requests.
-
----
-
-## Bug Reports & Issues
-
-- **File bugs:** [iterm2.com/bugs](https://iterm2.com/bugs)
-- **Issue tracker:** [GitLab Issues](https://gitlab.com/gnachman/iterm2/issues)
-
-> **Note:** We use GitLab for issues because it provides better support for attachments.
-
----
-
-## Resources
-
-| Resource         | Link                                                              |
-| ---------------- | ----------------------------------------------------------------- |
-| Official Website | [iterm2.com](https://iterm2.com)                                  |
-| Documentation    | [iterm2.com/documentation](https://iterm2.com/documentation.html) |
-| Community        | [iTerm2 Discussions](https://gitlab.com/gnachman/iterm2/-/issues) |
-| Downloads        | [iterm2.com/downloads](https://iterm2.com/downloads.html)         |
-
----
-
-## License
-
-iTerm2 is distributed under the [GPLv3](LICENSE) license.
-
----
-
-## Support
-
-If you love iTerm2, consider:
-
-- Starring this repository
-- Spreading the word
-- [Sponsoring development](https://iterm2.com/donate.html)
-
----
-
-<div align="center">
-
-**Made by [George Nachman](https://github.com/gnachman) and [contributors](https://github.com/gnachman/iTerm2/graphs/contributors)**
-
-</div>
+The existing [LICENSE](LICENSE) contains GPL version 2, and [COPYING](COPYING)
+states GPL version 2 or later. COPYING also notes that Apache 2.0 dependencies
+make the combined distribution effectively GPL version 3. These files and
+third-party notices are retained. See [NOTICE](NOTICE) for attribution.

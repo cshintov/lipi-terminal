@@ -3249,6 +3249,7 @@ static void SetAgainstGrainDim(BOOL isVertical, NSSize *dest, CGFloat value) {
                         showTitles:(BOOL)showTitles
                showBottomStatusBar:(BOOL)showBottomStatusBar
                        showToolbar:(BOOL)showToolbar
+                      footerHeight:(CGFloat)footerHeight
                         rightExtra:(CGFloat)rightExtra
                         inTerminal:(id<WindowControllerInterface>)term {
     int rows = dimensions.height;
@@ -3282,6 +3283,7 @@ static void SetAgainstGrainDim(BOOL isVertical, NSSize *dest, CGFloat value) {
     if (showToolbar) {
         outerSize.height += [SessionView toolbarHeight];
     }
+    outerSize.height += footerHeight;
     DLog(@"session size, including space for the scrollview's decoration, is %@", NSStringFromSize(outerSize));
     return outerSize;
 }
@@ -3294,6 +3296,7 @@ static void SetAgainstGrainDim(BOOL isVertical, NSSize *dest, CGFloat value) {
                                  showTitles:[sessionView showTitle]
                         showBottomStatusBar:sessionView.showBottomStatusBar
                               showToolbar:(sessionView.toolbarReservedHeight > 0)
+                              footerHeight:sessionView.footerReservedHeight
                                  rightExtra:session.desiredRightExtra
                                  inTerminal:parentWindow_];
 }
@@ -5178,6 +5181,7 @@ typedef struct {
 // toolbar (e.g. the workgroups toolbar). Populated by -annotateSessionDecorationsInTmuxParseTree:
 // and consumed by the geometry pass so that pass doesn't need the tmux controller.
 static NSString *const PTYTabParseTreeShowToolbarKey = @"iTerm2ShowToolbar";
+static NSString *const PTYTabParseTreeFooterHeightKey = @"iTerm2FooterHeight";
 
 // Private, derived parse-tree key: the width a leaf's session reserves to the right of its grid
 // (adjacent timestamps and right-gutter panels like clippings). Populated alongside
@@ -5197,6 +5201,9 @@ static NSString *const PTYTabParseTreeRightExtraKey = @"iTerm2RightExtra";
             const int windowPane = [parseTree[kLayoutDictWindowPaneKey] intValue];
             PTYSession *session = [tmuxController sessionForWindowPane:windowPane];
             parseTree[PTYTabParseTreeShowToolbarKey] = @(session.view.toolbarReservedHeight > 0);
+            // New views use the same creation predicate as SessionView init; existing views own their reservation.
+            parseTree[PTYTabParseTreeFooterHeightKey] = @(session ? session.view.footerReservedHeight :
+                ([iTermAdvancedSettingsModel naturalRows] ? [SessionView malayalamCellStripHeight] : 0));
             parseTree[PTYTabParseTreeRightExtraKey] =
                 @(session ? session.desiredRightExtra : [PTYSession desiredRightExtraForProfile:profile session:nil]);
             break;
@@ -5243,12 +5250,17 @@ static NSString *const PTYTabParseTreeRightExtraKey = @"iTerm2RightExtra";
             // the right edge of the window.
             NSNumber *annotatedRightExtra = [NSNumber castFrom:parseTree[PTYTabParseTreeRightExtraKey]];
             const CGFloat rightExtra = annotatedRightExtra ? annotatedRightExtra.doubleValue : [PTYSession desiredRightExtraForProfile:profile session:nil];
+            NSNumber *annotatedFooter = [NSNumber castFrom:parseTree[PTYTabParseTreeFooterHeightKey]];
+            // A floats-only root is a virtual container, not a SessionView with its own footer.
+            const CGFloat footerHeight = annotatedFooter ? annotatedFooter.doubleValue :
+                (!floatsOnlyRoot && [iTermAdvancedSettingsModel naturalRows] ? [SessionView malayalamCellStripHeight] : 0);
             const NSSize size = [PTYTab _sessionSizeWithCellSize:cellSize
                                                       dimensions:NSMakeSize([parseTree[kLayoutDictWidthKey] intValue],
                                                                             [parseTree[kLayoutDictHeightKey] intValue])
                                                       showTitles:showTitles
                                              showBottomStatusBar:showBottomStatusBar
                                                      showToolbar:[parseTree[PTYTabParseTreeShowToolbarKey] boolValue]
+                                                     footerHeight:footerHeight
                                                       rightExtra:rightExtra
                                                       inTerminal:term];
             parseTree[kLayoutDictPixelWidthKey] = @(size.width);
@@ -5875,7 +5887,7 @@ typedef struct {
             DLog(@"%@ showTitle=%@ (%@) showBottomStatusBar=%@ (%@) toolbarHeight=%@",
                  sessionView, @(sessionView.showTitle), @(titleBarHeight),
                  @(sessionView.showBottomStatusBar), @(statusBarHeight), @(toolbarHeight));
-            return @(titleBarHeight + statusBarHeight + toolbarHeight + margins.height);
+            return @(titleBarHeight + statusBarHeight + toolbarHeight + sessionView.footerReservedHeight + margins.height);
         }];
         DLog(@"Decoration sizes are %@", decorationSizes);
         const CGFloat totalDecorationSize = [decorationSizes sumOfNumbers] + numberOfDividers * dividerThickness;
@@ -6254,6 +6266,7 @@ typedef struct {
                                                    showTitles:sessionView.showTitle
                                           showBottomStatusBar:sessionView.showBottomStatusBar
                                                 showToolbar:(sessionView.toolbarReservedHeight > 0)
+                                                footerHeight:sessionView.footerReservedHeight
                                                    rightExtra:session.desiredRightExtra
                                                    inTerminal:realParentWindow_];
         } else {
@@ -7041,6 +7054,7 @@ typedef struct {
                                                   showTitles:YES
                                          showBottomStatusBar:NO
                                                  showToolbar:NO
+                                                footerHeight:([iTermAdvancedSettingsModel naturalRows] ? [SessionView malayalamCellStripHeight] : 0)
                                                   rightExtra:[PTYSession desiredRightExtraForProfile:profile session:nil]
                                                   inTerminal:realParentWindow_];
     SessionView *view = [[SessionView alloc] initWithFrame:NSMakeRect(0, 0, viewSize.width, viewSize.height)];
@@ -7311,6 +7325,7 @@ typedef struct {
                                         showTitles:showTitles
                                showBottomStatusBar:NO
                                      showToolbar:(sessionView.toolbarReservedHeight > 0)
+                                     footerHeight:sessionView.footerReservedHeight
                                         rightExtra:sessionView.desiredRightExtra
                                         inTerminal:self.realParentWindow];
     NSRect frame = {

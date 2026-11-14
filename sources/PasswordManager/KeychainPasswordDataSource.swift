@@ -254,11 +254,15 @@ fileprivate class LegacyKeychainAccount: NSObject, PasswordManagerAccount {
 class KeychainPasswordDataSource: NSObject, PasswordManagerDataSource {
     private let browser: Bool
     private var serviceName: String {
+#if LIPI_TERMINAL
+        browser ? "io.github.cshintov.lipi-terminal.browser-passwords" : "io.github.cshintov.lipi-terminal.passwords"
+#else
         if browser {
             "iTerm2-Browser"
         } else {
             "iTerm2"
         }
+#endif
     }
     init(browser: Bool) {
         self.browser = browser

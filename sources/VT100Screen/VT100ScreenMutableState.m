@@ -2211,6 +2211,7 @@ void VT100ScreenEraseCell(screen_char_t *sct,
         [delegate screenRefreshFindOnPageView];
         [unpauser unpause];
     } name:@"clear scrollback buffer"];
+    [self redrawSoon];
 }
 
 - (void)clearBufferWithoutTriggersSavingPrompt:(BOOL)savePrompt {

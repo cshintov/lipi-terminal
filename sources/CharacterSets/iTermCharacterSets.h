@@ -39,6 +39,20 @@ NS_INLINE BOOL iTermIsModifierForcingFullWidth(uint32_t cp) {
 // Check if a code point is an RTL-indicating code point.
 BOOL iTermIsRTLCodePoint(uint32_t cp);
 
+// Check if a code point is in the Malayalam block (U+0D00..U+0D7F).
+// Single source of truth for the range checks that were repeated in the
+// drawing, layout and cell-splitting paths. Callable from Objective-C and
+// Swift: this header is already imported by iTerm2SharedARC-Bridging-Header.h.
+NS_INLINE BOOL iTermIsMalayalamCodePoint(uint32_t cp) {
+    return cp >= 0x0D00 && cp <= 0x0D7F;
+}
+
+// Enabled scripts for natural drawing and attached spacing-mark cell ownership.
+NS_INLINE BOOL iTermIsNaturalRowCodePoint(uint32_t cp, BOOL malayalamEnabled, BOOL hindiEnabled) {
+    return (malayalamEnabled && iTermIsMalayalamCodePoint(cp)) ||
+        (hindiEnabled && cp >= 0x0900 && cp <= 0x097F);
+}
+
 // Scan a CFString for any RTL code point. Returns YES if found.
 BOOL iTermStringContainsRTL(CFStringRef s);
 

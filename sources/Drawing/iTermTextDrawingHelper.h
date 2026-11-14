@@ -17,6 +17,9 @@
 #import "VT100GridTypes.h"
 
 @class iTermAttributedStringBuilder;
+@class iTermMalayalamRowLayout;
+@class iTermMalayalamTableSource;
+@class iTermMalayalamDisplayMap;
 @class iTermBoxedBackgroundColorRun;
 @class iTermButtonPillInfo;
 @class iTermColorMap;
@@ -34,6 +37,7 @@
 @class PTYFontInfo;
 @class ScreenCharArray;
 @protocol VT100ScreenMarkReading;
+
 
 typedef NS_ENUM(NSUInteger, iTermMarkIndicatorType) {
     iTermMarkIndicatorTypeSuccess,
@@ -125,6 +129,39 @@ extern const int iTermTextDrawingHelperLineStyleMarkRightInsetCells;
 extern const CGFloat iTermCursorGuideAlphaThreshold;
 
 @interface iTermTextDrawingHelper : NSObject
+
+@property(nonatomic, readonly) iTermMalayalamTableSource *malayalamPreparedTableSource;
+@property(nonatomic, readonly) NSUInteger malayalamRowLayoutBuildCount;
+@property(nonatomic, readonly) NSUInteger malayalamRowLayoutPreparationCount;
+
+// Experimental shared geometry, in document-row coordinates. nil means original grid layout.
+- (iTermMalayalamRowLayout *)malayalamLayoutAtLine:(int)line;
+// As with ordinary row construction, call didFinishSetup after changing presentation properties.
+// eligible is nonnull: nil layout plus YES means a safe identity row, NO means explicit fallback.
+- (iTermMalayalamRowLayout *)malayalamLayoutAtLine:(int)line mapEligible:(BOOL *)eligible;
+// Nonnull outputs, prose metadata shares the canonical row fetch while paragraph flow is enabled.
+- (iTermMalayalamRowLayout *)malayalamLayoutAtLine:(int)line mapEligible:(BOOL *)eligible
+                                      sourceEol:(int *)eol sourceText:(NSString **)sourceText;
+// The shift is only a previous-layout hint; row eligibility and full builder equality still apply.
+- (void)beginMalayalamMapPassWithPreviousSourceRowShift:(NSInteger)shift;
+- (void)endMalayalamMapPass;
+- (BOOL)rowContainsMalayalam:(ScreenCharArray *)row;
+- (NSNumber *)malayalamXForColumn:(int)column line:(int)line;
+- (NSNumber *)malayalamColumnForX:(CGFloat)x line:(int)line;
+
+@property(nonatomic, strong) iTermMalayalamDisplayMap *malayalamDisplayMap;
+- (NSArray<NSValue *> *)malayalamSelectionRects:(NSRange)columns layout:(iTermMalayalamRowLayout *)layout
+                                          line:(int)line partial:(BOOL *)partial;
+- (CGFloat)displayYForColumn:(int)column sourceRow:(int)row;
+- (int)sourceRowForDisplayRow:(int)row;
+- (NSNumber *)malayalamColumnForX:(CGFloat)x displayRow:(int)row;
+- (NSValue *)malayalamCellForX:(CGFloat)x displayRow:(int)row NS_SWIFT_NAME(malayalamCell(forX:displayRow:));
+- (NSValue *)malayalamCellForX:(CGFloat)x displayRow:(int)row reportingMouseCell:(BOOL)reporting;
+- (NSNumber *)malayalamColumnForX:(CGFloat)x displayRow:(int)row reportingMouseCell:(BOOL)reporting;
+- (NSNumber *)malayalamColumnForX:(CGFloat)x line:(int)line reportingMouseCell:(BOOL)reporting;
+
+// Footer-only inspection intent in absolute source cells; x < 0 means none.
+@property(nonatomic, assign) VT100GridAbsCoord malayalamInspectionCell;
 
 // Holds the current selection, if any.
 @property(nonatomic, retain) iTermSelection *selection;
@@ -266,6 +303,7 @@ extern const CGFloat iTermCursorGuideAlphaThreshold;
 
 // Does bold text render as the bright version of a dim ansi color, and also use specified bold color?
 @property(nonatomic, assign) BOOL useCustomBoldColor;
+@property(nonatomic, assign) BOOL brightenBold;
 
 // Is this the current text view of the "front" terminal window?
 // TODO: This might be the same as textViewIsActiveSession.
@@ -534,8 +572,10 @@ extern const CGFloat iTermCursorGuideAlphaThreshold;
 
 // Configure cached metrics for offscreen rendering without calling delegate methods.
 // Use this when rendering to an offscreen bitmap where the delegate's geometry is different.
+// renderedRows excludes image margins and is the exact requested source-row coverage.
 - (void)configureForOffscreenRenderingWithFrame:(NSRect)frame
-                                    visibleRect:(NSRect)visibleRect;
+                                    visibleRect:(NSRect)visibleRect
+                                   renderedRows:(NSRange)renderedRows;
 
 @end
 

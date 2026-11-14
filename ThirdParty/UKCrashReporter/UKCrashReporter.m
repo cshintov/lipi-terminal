@@ -338,6 +338,9 @@ NSString*    gCrashLogString = nil;
 
 -(IBAction)    sendCrashReport: (id)sender
 {
+#if LIPI_TERMINAL
+    return;
+#else
     NSString            *boundary = @"0xKhTmLbOuNdArY";
     NSMutableString*    crashReportString = [NSMutableString string];
     [crashReportString appendString: [informationField string]];
@@ -389,6 +392,7 @@ NSString*    gCrashLogString = nil;
     }];
     [_dataTask retain];
     [_dataTask resume];
+#endif
 }
 
 

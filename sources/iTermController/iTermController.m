@@ -140,9 +140,11 @@ static iTermController *gSharedInstance;
     if (self) {
         // A test host would offer to report any recent iTerm2 crash in a modal window, which
         // blocks button and menu actions in the tests that follow.
+#if !LIPI_TERMINAL
         if (![NSApp isRunningUnitTests]) {
             UKCrashReporterCheckForCrash();
         }
+#endif
 
         // create the "~/Library/Application Support/iTerm2" directory if it does not exist
         [[NSFileManager defaultManager] applicationSupportDirectory];
@@ -1373,6 +1375,7 @@ replaceInitialDirectoryForSessionWithGUID:(NSString *)guid
 }
 
 - (void)refreshSoftwareUpdateUserDefaults {
+#if !LIPI_TERMINAL
     BOOL checkForTestReleases = [iTermPreferences boolForKey:kPreferenceKeyCheckForTestReleases];
     NSString *appCast = checkForTestReleases ?
         [[NSBundle mainBundle] objectForInfoDictionaryKey:@"SUFeedURLForTesting"] :
@@ -1388,6 +1391,7 @@ replaceInitialDirectoryForSessionWithGUID:(NSString *)guid
     // bd6a8df6e63b843f1f8aff79f40bd70907761a99.
     [[iTermUserDefaults userDefaults] setObject:@"iTerm"
                                               forKey:@"SUFeedAlternateAppNameKey"];
+#endif
 }
 
 - (BOOL)selectionRespectsSoftBoundaries {

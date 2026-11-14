@@ -224,6 +224,9 @@ typedef NS_ENUM(NSUInteger, iTermSessionViewFindDriver) {
 // Vertical space the per-session toolbar (e.g. the workgroups toolbar) reserves at
 // the top, or 0 when there is no toolbar. Parallel to -titleReservedHeight.
 @property(nonatomic, readonly) CGFloat toolbarReservedHeight;
+// Physical reservation follows the allocated strip, not a later advanced-setting toggle.
+@property(nonatomic, readonly) CGFloat footerReservedHeight;
++ (CGFloat)malayalamCellStripHeight;
 // Whether a decoration holding clickable controls (the toolbar, the title bar,
 // the status bar, or a browser's navigation bar) overlaps `rect`, which is in
 // window coordinates.

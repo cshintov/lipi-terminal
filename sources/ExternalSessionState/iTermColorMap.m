@@ -552,7 +552,7 @@ const int kColorMapAnsiBrightModifier = 8;
     }
     dimmedRgb[3] = backgroundRgb[3];
 
-    if (!memcmp(_lastBackgroundComponents, dimmedRgb, sizeof(CGFloat) * 4)) {
+    if (_lastBackgroundColor && !memcmp(_lastBackgroundComponents, dimmedRgb, sizeof(CGFloat) * 4)) {
         return _lastBackgroundColor;
     } else {
         memmove(_lastBackgroundComponents, dimmedRgb, sizeof(CGFloat) * 4);

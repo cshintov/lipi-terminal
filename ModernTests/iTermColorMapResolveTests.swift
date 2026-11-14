@@ -20,6 +20,39 @@ final class iTermColorMapResolveTests: XCTestCase {
         return map
     }
 
+    func testProcessedBackgroundColdCacheAndShortSequences() throws {
+        // Zero RGBA is a legitimate first request, including the monochrome offscreen margin path.
+        let traces = [[]] + (0..<3).map { [$0] } +
+            (0..<3).flatMap { first in (0..<3).map { [first, $0] } }
+        for trace in traces {
+            var map = makeMap(backgroundIsDark: true)
+            var opaque = false
+            var whiteBackground = false
+            for event in trace.isEmpty ? [-1] : trace {
+                switch event {
+                case 0: opaque.toggle()
+                case 1: map = try XCTUnwrap(map.copy())
+                case 2:
+                    whiteBackground.toggle()
+                    map.setColor(whiteBackground ? .white : .black, forKey: Int32(kColorMapBackground))
+                default: break
+                }
+                let level: CGFloat = opaque ? 0.25 : 0
+                let alpha: CGFloat = opaque ? 1 : 0
+                let input = NSColor(srgbRed: level, green: level, blue: level, alpha: alpha)
+                let result = try XCTUnwrap(map.processedBackgroundColor(forBackgroundColor: input),
+                                          "cold/copy/change trace \(trace)")
+                let rgb = try XCTUnwrap(result.usingColorSpace(.sRGB))
+                XCTAssertEqual(rgb.redComponent, level, accuracy: 0.00001)
+                XCTAssertEqual(rgb.greenComponent, level, accuracy: 0.00001)
+                XCTAssertEqual(rgb.blueComponent, level, accuracy: 0.00001)
+                XCTAssertEqual(rgb.alphaComponent, alpha, accuracy: 0.00001)
+                let hit = try XCTUnwrap(map.processedBackgroundColor(forBackgroundColor: input))
+                XCTAssertEqual(hit, result, "a populated cache hit preserves the color")
+            }
+        }
+    }
+
     func testResolvedColorValuePassesThroughWhenNoDarkVariant() {
         let map = makeMap(backgroundIsDark: false)
         let v = VT100TerminalColorValue(red: 11, green: 22, blue: 33, mode: ColorMode24bit,

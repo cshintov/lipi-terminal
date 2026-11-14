@@ -50,6 +50,19 @@ int main(int argc, const char *argv[]) {
         // Run a server that spawns a job.
         return iterm2_server(argc - 2, (char *const *)argv + 2);
     }
+    // Reject a mismatched public package before touching preferences or creating an updater.
+    const BOOL lipiPackage = [[[NSBundle mainBundle] objectForInfoDictionaryKey:@"LipiPublicBuild"] boolValue];
+#if LIPI_TERMINAL
+    if (!lipiPackage || ![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"io.github.cshintov.lipi-terminal"]) {
+        fprintf(stderr, "Lipi public build identity mismatch\n");
+        return 78;
+    }
+#else
+    if (lipiPackage) {
+        fprintf(stderr, "Lipi package requires a Lipi-compiled executable\n");
+        return 78;
+    }
+#endif
     // Normal launch of GUI.
     // Parse -suite argument before any UserDefaults access.
     // Uses -suite (not --suite=) so Cocoa's argument parser treats it as a
@@ -66,6 +79,15 @@ int main(int argc, const char *argv[]) {
             break;
         }
     }
+#if LIPI_TERMINAL
+    // A Finder launch must be just as isolated as a launch with an explicit test suite.
+    if (![iTermUserDefaults customSuiteName]) {
+        NSString *suiteName = [iTermTestHostIsolation suiteNameForBase:@"lipi-terminal"];
+        [iTermUserDefaults setCustomSuiteName:suiteName];
+        NSString *prefix = [NSString stringWithFormat:@"%@.socket.", suiteName];
+        iTermFileDescriptorSetSocketNamePrefix(prefix.UTF8String);
+    }
+#endif
     [iTermInstanceLock acquire];
     if ([[iTermUserDefaults userDefaults] boolForKey:@"MetalCaptureEnabled"]) {
         setenv("MTL_CAPTURE_ENABLED", "1", 1);

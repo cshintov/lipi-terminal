@@ -90,10 +90,9 @@ static void VT100GridSetMinimumContentGeneration(int64_t minValue) {
     NSTimeInterval _allDirtyTimestamp;
     BOOL allDirty_;
     // Base of a reserved block of line generations for the current all-dirty
-    // epoch. While allDirty_ is set, generationForLine: hands line y the identity
-    // _allDirtyGenerationBase + y so every line reports a distinct, never-reused
-    // generation (the per-row cache misses uniformly) without touching every
-    // VT100LineInfo. Reserved once per NO->YES transition; see setAllDirty:.
+    // epoch. Each physical ring slot owns one reserved identity, which moves
+    // with its content without touching every VT100LineInfo. Reserved once per
+    // NO->YES transition; see setAllDirty:.
     int64_t _allDirtyGenerationBase;
     NSMutableArray *_bidiInfo;  // iTermBidiDisplayInfo or NSNull
     BOOL _bidiDirty;  // Did _bidiInfo change?
@@ -568,7 +567,9 @@ NS_INLINE int VT100GridLineInfoIndex(VT100Grid *self, int lineNumber) {
         // from the reserved block so the row cache misses uniformly. Take the max
         // with the per-line value so a line individually dirtied after the epoch
         // began (which got a generation past the reserved block) still wins.
-        return MAX(perLine, _allDirtyGenerationBase + y);
+        // Anchor to the physical slot: scrolling rotates content and line info,
+        // so an epoch identity must travel with them, not stay at logical row y.
+        return MAX(perLine, _allDirtyGenerationBase + VT100GridLineInfoIndex(self, y));
     }
     return perLine;
 }

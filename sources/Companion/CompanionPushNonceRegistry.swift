@@ -174,7 +174,11 @@ final class CompanionPushNonceRegistry {
 /// Keychain-backed store: the nonce list as a JSON array in one generic-password
 /// item (this-device-only), beside the other companion mac keychain items.
 final class KeychainNonceStore: CompanionNonceStore {
+#if LIPI_TERMINAL
+    private let service = "io.github.cshintov.lipi-terminal.companion"
+#else
     private let service = "com.googlecode.iterm2.companion"
+#endif
     private let baseAccount = "push-nonce-registry"
 
     // Namespace the keychain account by the -suite name when the app runs against a

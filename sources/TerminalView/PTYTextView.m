@@ -48,6 +48,7 @@
 #import "ToastWindowController.h"
 #import "VT100RemoteHost.h"
 #import "VT100ScreenMark.h"
+#import "VT100Screen.h"
 #import "WindowControllerInterface.h"
 #import "charmaps.h"
 #import "iTerm.h"
@@ -159,6 +160,13 @@ const CGFloat PTYTextViewMarginClickGraceWidth = 2.0;
 
     // Helps drawing text and background.
     iTermTextDrawingHelper *_drawingHelper;
+    // Retain the inspected cell when changed widths regroup visual fragments.
+    VT100GridCoord _malayalamScrollAnchor;
+    int _malayalamScrollAnchorDisplayRow;
+    long long _malayalamMapScrollbackOverflow;
+    CGFloat _malayalamMapLineHeight;
+    BOOL _malayalamFontAnchorPending;
+    CGFloat _malayalamFontAnchorFraction;
 
     // Whether the current drag entering our view was routed to a Kitty DnD
     // program. Latched at draggingEntered so a mid-drag Option press (or a program
@@ -223,7 +231,7 @@ const CGFloat PTYTextViewMarginClickGraceWidth = 2.0;
     BOOL _haveTooltips;
 
     NSMutableData *_marginColorWidthBuffer;
-    NSMutableData *_marginColorTwiceHeightBuffer;
+    NSMutableData *_marginColorValuesBuffer;
 
     // Cursor slide animation (handles both legacy and Metal paths)
     iTermCursorSlideAnimator *_cursorSlideAnimator;
@@ -275,6 +283,8 @@ const CGFloat PTYTextViewMarginClickGraceWidth = 2.0;
         // to know I want to keep control over this because debugging it will be horrible. So every
         // draw call (NSRectFill, etc.) does a last-second translation by the virtual offset.
         [super setAlphaValue:0];
+        _malayalamScrollAnchor = VT100GridCoordMake(-1, -1);
+        _malayalamMapScrollbackOverflow = -1;
         _drawingHelper = [[iTermTextDrawingHelper alloc] init];
         _drawingHelper.delegate = self;
 
@@ -441,7 +451,7 @@ const CGFloat PTYTextViewMarginClickGraceWidth = 2.0;
     [_selectCommandTimer invalidate];
     [_selectCommandTimer release];
     [_marginColorWidthBuffer release];
-    [_marginColorTwiceHeightBuffer release];
+    [_marginColorValuesBuffer release];
     _cursorSlideAnimator.delegate = nil;
     [_cursorSlideAnimator release];
 
@@ -664,8 +674,14 @@ const CGFloat PTYTextViewMarginClickGraceWidth = 2.0;
     if ([_dataSource numberOfLines] <= 0) {
       return;
     }
+    if (_drawingHelper.malayalamDisplayMap) {
+        NSRect viewport = self.enclosingScrollView.documentVisibleRect;
+        viewport.origin.y = [self malayalamFollowOrigin];
+        [self scrollRectToVisible:viewport];
+        return;
+    }
     NSRect lastLine = [self visibleRect];
-    lastLine.origin.y = (([_dataSource numberOfLines] - 1) * _lineHeight +
+    lastLine.origin.y = (([self malayalamDisplayRowCount] - 1) * _lineHeight +
                          [self excess] +
                          _drawingHelper.numberOfIMELines * _lineHeight);
     lastLine.size.height = _lineHeight;
@@ -849,15 +865,20 @@ const CGFloat PTYTextViewMarginClickGraceWidth = 2.0;
 
 - (long long)absoluteScrollPosition {
     NSRect visibleRect = [self visibleRect];
+    if (_drawingHelper.malayalamDisplayMap) {
+        return [_drawingHelper sourceRowForDisplayRow:floor(NSMinY(self.enclosingScrollView.contentView.bounds) / _lineHeight)] +
+            [_dataSource totalScrollbackOverflow];
+    }
     long long localOffset = (visibleRect.origin.y + [iTermPreferences topBottomMargins]) / [self lineHeight];
-    return localOffset + [_dataSource totalScrollbackOverflow];
+    return [_drawingHelper sourceRowForDisplayRow:(int)localOffset] + [_dataSource totalScrollbackOverflow];
 }
 
 - (void)scrollToAbsoluteOffset:(long long)absOff height:(int)height
 {
     NSRect aFrame;
     aFrame.origin.x = 0;
-    aFrame.origin.y = (absOff - [_dataSource totalScrollbackOverflow]) * _lineHeight - [iTermPreferences topBottomMargins];
+    int sourceRow = (int)(absOff - [_dataSource totalScrollbackOverflow]);
+    aFrame.origin.y = [_drawingHelper displayYForColumn:0 sourceRow:sourceRow] - [iTermPreferences topBottomMargins];
     aFrame.size.width = [self frame].size.width;
     aFrame.size.height = _lineHeight * height;
     [self scrollRectToVisible: aFrame];
@@ -911,9 +932,10 @@ const CGFloat PTYTextViewMarginClickGraceWidth = 2.0;
     [self withRelativeCoordRange:[_selection spanningAbsRange] block:^(VT100GridCoordRange range) {
         NSRect aFrame;
         aFrame.origin.x = 0;
-        aFrame.origin.y = range.start.y * _lineHeight - [iTermPreferences topBottomMargins];  // allow for top margin
+        aFrame.origin.y = [_drawingHelper displayYForColumn:range.start.x sourceRow:range.start.y] - [iTermPreferences topBottomMargins];
         aFrame.size.width = [self frame].size.width;
-        aFrame.size.height = (range.end.y - range.start.y + 1) * _lineHeight;
+        aFrame.size.height = [_drawingHelper displayYForColumn:range.end.x sourceRow:range.end.y] + _lineHeight -
+            (aFrame.origin.y + [iTermPreferences topBottomMargins]);
         [self cancelMomentumScroll];
         [self lockScroll];
         [self scrollRectToVisible:aFrame];
@@ -938,6 +960,10 @@ const CGFloat PTYTextViewMarginClickGraceWidth = 2.0;
 }
 
 - (void)scrollToCenterLine:(int)line {
+    [self scrollToCenterY:[_drawingHelper displayYForColumn:0 sourceRow:line]];
+}
+
+- (void)scrollToCenterY:(CGFloat)y {
     NSRect visible = [self visibleRect];
     int visibleLines = (visible.size.height - [iTermPreferences topBottomMargins] * 2) / _lineHeight;
     int lineMargin = (visibleLines - 1) / 2;
@@ -945,7 +971,7 @@ const CGFloat PTYTextViewMarginClickGraceWidth = 2.0;
 
     NSRect aFrame;
     aFrame.origin.x = 0;
-    aFrame.origin.y = MAX(0, line * _lineHeight - margin);
+    aFrame.origin.y = MAX(0, y - margin);
     aFrame.size.width = [self frame].size.width;
     aFrame.size.height = margin * 2 + _lineHeight;
     double end = aFrame.origin.y + aFrame.size.height;
@@ -963,7 +989,7 @@ const CGFloat PTYTextViewMarginClickGraceWidth = 2.0;
 
     NSRect aFrame;
     aFrame.origin.x = 0;
-    aFrame.origin.y = MAX(0, line * _lineHeight - topMargin);
+    aFrame.origin.y = MAX(0, [_drawingHelper displayYForColumn:0 sourceRow:line] - topMargin);
     aFrame.size.width = [self frame].size.width;
     aFrame.size.height = visible.size.height;
     const CGFloat end = aFrame.origin.y + aFrame.size.height;
@@ -977,7 +1003,13 @@ const CGFloat PTYTextViewMarginClickGraceWidth = 2.0;
 
 - (NSRange)visibleRelativeRange {
     NSRect visibleRect = [[self enclosingScrollView] documentVisibleRect];
-    
+    if (_drawingHelper.malayalamDisplayMap && _lineHeight > 0) {
+        visibleRect = self.enclosingScrollView.contentView.bounds;
+        int first = [_drawingHelper sourceRowForDisplayRow:floor(NSMinY(visibleRect) / _lineHeight)];
+        int last = (int)[_drawingHelper.malayalamDisplayMap lastSourceRowAtDisplayRow:floor((NSMaxY(visibleRect) - 0.001) / _lineHeight)];
+        return NSMakeRange(first, MAX(0, last - first + 1));
+    }
+
     // Guard against invalid line height
     if (_lineHeight < 1) {
         return NSMakeRange(NSNotFound, 0);
@@ -1086,6 +1118,11 @@ const CGFloat PTYTextViewMarginClickGraceWidth = 2.0;
 
 - (void)requestDelegateRedrawInRect:(NSRect)rect {
     DLog(@"-[PTYTextView requestDelegateRedrawInRect:%@]", NSStringFromRect(rect));
+    if ([iTermAdvancedSettingsModel naturalRows]) {
+        // A cursor move may pan an entire old/new row. Never clip repaint to its old grid cell.
+        [self requestDelegateRedraw];
+        return;
+    }
     if (NSIsEmptyRect(rect)) {
         [self requestDelegateRedraw];
         return;
@@ -1260,17 +1297,34 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
     }
 }
 
+- (BOOL)withStableMalayalamInspectionDuringMouseDown:(BOOL (^)(void))dispatch {
+    const VT100GridAbsCoord inspection = _drawingHelper.malayalamInspectionCell;
+    const VT100GridSize grid = VT100GridSizeMake(_dataSource.width, _dataSource.height);
+    const BOOL result = dispatch();
+    // Mouse-down clears the old selection before starting a live drag. Keep its hit projection stable.
+    if (_selection.live && inspection.x >= 0 && [iTermAdvancedSettingsModel naturalRows] &&
+        grid.width == _dataSource.width && grid.height == _dataSource.height) {
+        _drawingHelper.malayalamInspectionCell = inspection;
+    }
+    return result;
+}
+
 - (void)mouseDown:(NSEvent *)event {
     [_selectCommandTimer invalidate];
     [_selectCommandTimer release];
     _selectCommandTimer = nil;
     
     [self.delegate textViewWillHandleMouseDown:event];
-    [_mouseHandler mouseDown:event superCaller:^{ [super mouseDown:event]; }];
+    [self withStableMalayalamInspectionDuringMouseDown:^BOOL {
+        [_mouseHandler mouseDown:event superCaller:^{ [super mouseDown:event]; }];
+        return NO;
+    }];
 }
 
 - (BOOL)mouseDownImpl:(NSEvent *)event {
-    return [_mouseHandler mouseDownImpl:event];
+    return [self withStableMalayalamInspectionDuringMouseDown:^BOOL {
+        return [_mouseHandler mouseDownImpl:event];
+    }];
 }
 
 - (void)mouseUp:(NSEvent *)event {
@@ -1515,11 +1569,19 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
 - (NSRect)adjustedDocumentVisibleRectIncludingTopMargin:(BOOL)includeTopMargin {
     const BOOL userScroll = [(PTYScroller*)([[self enclosingScrollView] verticalScroller]) userScroll];
     if (!userScroll) {
+        if (_drawingHelper.malayalamDisplayMap) {
+            NSRect rect = self.enclosingScrollView.documentVisibleRect;
+            rect.origin.y = [self malayalamFollowOrigin];
+            if (includeTopMargin) { rect.origin.y -= [iTermPreferences topBottomMargins]; }
+            else { rect.size.height -= [iTermPreferences topBottomMargins]; }
+            return rect;
+        }
         const NSRect result = [self bottommostRectExcludingTopMargin:!includeTopMargin];
         DLog(@"User scroll is off so return bottommost rect of %@", NSStringFromRect(result));
         return result;
     }
-    const NSRect documentVisibleRect = self.enclosingScrollView.documentVisibleRect;
+    const NSRect documentVisibleRect = _drawingHelper.malayalamDisplayMap ?
+        self.enclosingScrollView.contentView.bounds : self.enclosingScrollView.documentVisibleRect;
     const int overflow = [_dataSource scrollbackOverflow];
     const int firstRow = MAX(0, documentVisibleRect.origin.y / _lineHeight - overflow) + _drawingHelper.numberOfIMELines;
     const NSRect result = [self visibleRectExcludingTopMargin:!includeTopMargin
@@ -1537,11 +1599,14 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
         DLog(@"Draw document visible rect. virtualOffset=%@", @(virtualOffset));
         return virtualOffset;
     }
+    if (_drawingHelper.malayalamDisplayMap) {
+        return [self malayalamFollowOrigin] - [iTermPreferences topBottomMargins];
+    }
     // The documentVisibleRect could be wrong if we got more input since -refresh was last
     // called. Force the last lines to be drawn so the screen doesn't appear to jump as in issue
     // 9676.
     const int height = _dataSource.height;
-    const CGFloat virtualOffset = (_dataSource.numberOfLines - height + _drawingHelper.numberOfIMELines) * _lineHeight - [iTermPreferences topBottomMargins];
+    const CGFloat virtualOffset = ([self malayalamDisplayRowCount] - height + _drawingHelper.numberOfIMELines) * _lineHeight - [iTermPreferences topBottomMargins];
     DLog(@"Force draw last rows. numberOfLines=%@ height=%@ lineHeight=%@ bottomMargins=%@ -> virtualOffset=%@",
          @(_dataSource.numberOfLines), @(height), @(_lineHeight), @([iTermPreferences topBottomMargins]), @(virtualOffset));
     return virtualOffset;
@@ -1800,6 +1865,11 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
     }];
     [self shiftTrackingChildWindows];
 
+    if ([iTermAdvancedSettingsModel naturalRows]) {
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"iTermMalayalamRowDidDraw"
+                                                            object:self];
+    }
+
     if (_drawingHelper.cursorBlinkFadeWantsRedraw) {
         // Keep the smooth-blink cycle going by scheduling another cursor redraw.
         // This is a self-sustaining loop that runs at the display refresh rate
@@ -1817,6 +1887,63 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
 }
 
 #pragma mark - Debug overlay for prompt-mark ranges
+
+- (NSDictionary *)malayalamCellStripState {
+    if (![iTermAdvancedSettingsModel naturalRows] || !_drawingHelper || _dataSource.width <= 0) {
+        return nil;
+    }
+    const long long overflow = _dataSource.totalScrollbackOverflow;
+    const int cursorRow = _dataSource.numberOfLines - _dataSource.height + _dataSource.cursorY - 1;
+    long long absoluteRow = cursorRow + overflow;
+    iTermSubSelection *selected = _selection.logicalSubSelections.lastObject;
+    if (selected) {
+        absoluteRow = selected.absRange.coordRange.start.y;
+    }
+    const long long row = absoluteRow - overflow;
+    if (row < 0 || row >= _dataSource.numberOfLines) {
+        return nil;
+    }
+    NSIndexSet *columns = [_selection selectedIndexesOnAbsoluteLine:absoluteRow];
+    const NSInteger cursor = row == cursorRow ? _dataSource.cursorX - 1 : -1;
+    const VT100GridAbsCoord inspection = _drawingHelper.malayalamInspectionCell;
+    const BOOL validInspection = inspection.y == absoluteRow && inspection.x >= 0 && inspection.x < _dataSource.width &&
+        _drawingHelper.gridSize.width == _dataSource.width && _drawingHelper.gridSize.height == _dataSource.height &&
+        [columns containsIndex:inspection.x];
+    // Null-range normalization must not replace the exact cell chosen in the strip.
+    const NSInteger focus = validInspection ? inspection.x : (columns.count ? columns.firstIndex : MAX(0, cursor));
+    iTermMalayalamRowLayout *layout = [_drawingHelper malayalamLayoutAtLine:(int)row];
+    NSString *status = @"grid fallback";
+    if (layout) {
+        iTermMalayalamCellProjection *projection = [layout projectionAtColumn:focus];
+        status = projection && projection.kind == iTermMalayalamCaretKindNativeEdge ? @"native edge" :
+                 projection && projection.kind == iTermMalayalamCaretKindProvisionalClusterStart ? @"provisional anchor" : @"unresolved";
+        if (columns.count) {
+            iTermMalayalamRowSelection *source = [layout selectionForColumns:
+                NSMakeRange(columns.firstIndex, columns.lastIndex - columns.firstIndex + 1)];
+            if (source.startsInsideCluster || source.endsInsideCluster) {
+                status = @"partial cluster selection";
+            }
+        }
+    }
+    if (_drawingHelper.malayalamDisplayMap.tableNeedsWiderViewport) { status = @"table needs a wider viewport"; }
+    return @{ @"row": @(absoluteRow), @"width": @(_dataSource.width),
+              @"cursor": @(cursor), @"focus": @(focus), @"selected": columns ?: [NSIndexSet indexSet],
+              @"status": [NSString stringWithFormat:@"Row %lld: %@", absoluteRow, status] };
+}
+
+- (void)selectMalayalamColumn:(NSInteger)column absoluteRow:(long long)row {
+    const long long overflow = _dataSource.totalScrollbackOverflow;
+    if (![iTermAdvancedSettingsModel naturalRows] || column < 0 || column >= _dataSource.width ||
+        row < overflow || row - overflow >= _dataSource.numberOfLines) {
+        return;
+    }
+    // Selecting a source cell is deliberately independent of the PTY protocol cursor.
+    [_selection setSelectedLogicalRange:VT100GridAbsWindowedRangeMake(
+        VT100GridAbsCoordRangeMake((int)column, row, (int)column + 1, row), 0, 0)
+                                   mode:kiTermSelectionModeCharacter];
+    _drawingHelper.malayalamInspectionCell = VT100GridAbsCoordMake((int)column, row);
+    [self requestDelegateRedraw];
+}
 
 // Walks every visible line, finds the unique prompt marks intersecting the
 // viewport, and outlines each one's promptRange (blue), commandRange (green),
@@ -1942,7 +2069,7 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
 - (NSRect)bottommostRectExcludingTopMargin:(BOOL)excludeTopMargin {
     const int height = _dataSource.height;
     return [self visibleRectExcludingTopMargin:excludeTopMargin
-                                 startingAtRow:_dataSource.numberOfLines - height + _drawingHelper.numberOfIMELines];
+                                 startingAtRow:[self malayalamDisplayRowCount] - height + _drawingHelper.numberOfIMELines];
 }
 
 - (NSRect)visibleRectExcludingTopMargin:(BOOL)excludeTopMargin
@@ -2020,6 +2147,12 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
 // This is the single source of truth for drawing helper configuration.
 - (void)configureDrawingHelper:(iTermTextDrawingHelper *)helper forOffscreen:(BOOL)forOffscreen {
     // Rendering settings that apply to both onscreen and offscreen
+    if (![iTermAdvancedSettingsModel naturalRows] ||
+        _drawingHelper.gridSize.width != _dataSource.width || _drawingHelper.gridSize.height != _dataSource.height) {
+        _drawingHelper.malayalamInspectionCell = VT100GridAbsCoordMake(-1, -1);
+    }
+    helper.malayalamInspectionCell = _drawingHelper.malayalamInspectionCell;
+    helper.malayalamDisplayMap = _drawingHelper.malayalamDisplayMap;
     helper.cellSize = NSMakeSize(_charWidth, _lineHeight);
     helper.cellSizeWithoutSpacing = NSMakeSize(_charWidthWithoutSpacing, _charHeightWithoutSpacing);
     helper.ambiguousIsDoubleWidth = [_delegate textViewAmbiguousWidthCharsAreDoubleWidth];
@@ -2056,6 +2189,7 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
     helper.antiAliasedShift = isRetina ? 0.5 : 0;
     helper.useNonAsciiFont = _useNonAsciiFont;
     helper.useCustomBoldColor = _useCustomBoldColor;
+    helper.brightenBold = self.brightenBold;
     // These properties are only stored in _drawingHelper (no backing ivars), so copy from there
     helper.asciiAntiAlias = _drawingHelper.asciiAntiAlias;
     helper.nonAsciiAntiAlias = _drawingHelper.nonAsciiAntiAlias;
@@ -2451,9 +2585,140 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
     return r;
 }
 
+- (void)updateMalayalamDisplayMap {
+    const long long overflow = _dataSource.totalScrollbackOverflow;
+    NSInteger previousRowShift = 0;
+    if (_drawingHelper.malayalamDisplayMap && _malayalamMapScrollbackOverflow >= 0 &&
+        overflow >= _malayalamMapScrollbackOverflow) {
+        const long long delta = overflow - _malayalamMapScrollbackOverflow;
+        if (delta > 0 && delta < _drawingHelper.malayalamDisplayMap.sourceRowCount) {
+            previousRowShift = (NSInteger)delta;
+        }
+    }
+    // Stamp this geometry transaction, independently of drawing-helper setup and API syncs.
+    _malayalamMapScrollbackOverflow = overflow;
+    _malayalamMapLineHeight = _lineHeight;
+    if (![iTermAdvancedSettingsModel malayalamVisualWrap] || ![iTermAdvancedSettingsModel naturalRows]) {
+        _drawingHelper.malayalamDisplayMap = nil;
+        return;
+    }
+    iTermTextDrawingHelper *helper = [self drawingHelper];
+    _drawingHelper.malayalamDisplayMap = [self malayalamDisplayMapForHelper:helper previousSourceRowShift:previousRowShift];
+}
+
+- (iTermMalayalamDisplayMap *)malayalamDisplayMapForHelper:(iTermTextDrawingHelper *)helper {
+    return [self malayalamDisplayMapForHelper:helper previousSourceRowShift:0];
+}
+
+- (iTermMalayalamDisplayMap *)malayalamDisplayMapForHelper:(iTermTextDrawingHelper *)helper
+                                previousSourceRowShift:(NSInteger)previousRowShift {
+    __block iTermMalayalamDisplayMap *map = nil;
+    [_dataSource performBlockWithSavedGrid:^(id<PTYTextViewSynchronousUpdateStateReading> savedState) {
+        // History and the alternate grid share document source rows; embedded surfaces remain unsupported.
+        if (savedState || ![iTermAdvancedSettingsModel malayalamVisualWrap] ||
+            ![iTermAdvancedSettingsModel naturalRows] ||
+            ![_dataSource showingAlternateScreen] ||
+            [self hasMarkedText] || _portholes.count || [self hasAnyAnnotations] ||
+            self.showTimestamps || _drawingHelper.highlightCursorLine ||
+            [_delegate textViewHasBackgroundImage]) {
+            return;
+        }
+        NSMutableDictionary<NSNumber *, iTermMalayalamRowLayout *> *rows = [NSMutableDictionary dictionary];
+        NSMutableDictionary<NSNumber *, iTermMalayalamTableSource *> *tableSources = [NSMutableDictionary dictionary];
+        const BOOL paragraphFlow = [iTermAdvancedSettingsModel malayalamParagraphFlow];
+        NSMutableArray<NSNumber *> *eols = paragraphFlow ? [NSMutableArray array] : nil;
+        NSMutableArray<NSString *> *texts = paragraphFlow ? [NSMutableArray array] : nil;
+        [helper beginMalayalamMapPassWithPreviousSourceRowShift:previousRowShift];
+        @try {
+            for (int row = 0; row < _dataSource.numberOfLines; row++) {
+                BOOL eligible = NO;
+                int eol = EOL_HARD;
+                NSString *sourceText;
+                iTermMalayalamRowLayout *layout = paragraphFlow ?
+                    [helper malayalamLayoutAtLine:row mapEligible:&eligible sourceEol:&eol sourceText:&sourceText] :
+                    [helper malayalamLayoutAtLine:row mapEligible:&eligible];
+                if (paragraphFlow) { [eols addObject:@(eol)]; [texts addObject:sourceText ?: @""]; }
+                if (!eligible) { return; }
+                if (layout) { rows[@(row)] = layout; }
+                if (helper.malayalamPreparedTableSource) { tableSources[@(row)] = helper.malayalamPreparedTableSource; }
+            }
+        } @finally {
+            [helper endMalayalamMapPass];
+        }
+        const CGFloat width = MAX(1, NSWidth(self.enclosingScrollView.documentVisibleRect) -
+            2 * [iTermPreferences sideMargins] - 2);
+        iTermMalayalamDisplayMap *previousTableMap = helper.malayalamDisplayMap;
+        if (tableSources.count) {
+            BOOL matches = [previousTableMap matchesTableSources:tableSources cellWidth:_charWidth] &&
+                (paragraphFlow ? [previousTableMap matchesParagraphRows:rows rowCount:_dataSource.numberOfLines
+                    columns:_dataSource.width width:width sourceEols:eols sourceTexts:texts] :
+                    [previousTableMap matchesRows:rows rowCount:_dataSource.numberOfLines columns:_dataSource.width width:width]);
+            map = matches ? previousTableMap : [[[iTermMalayalamDisplayMap alloc] initWithRows:rows
+                rowCount:_dataSource.numberOfLines columns:_dataSource.width width:width sourceEols:eols sourceTexts:texts
+                tableSources:tableSources cellWidth:_charWidth previousMap:previousTableMap] autorelease];
+            return;
+        }
+        if (![previousTableMap matchesTableSources:tableSources cellWidth:_charWidth]) { previousTableMap = nil; }
+        if (paragraphFlow) {
+            iTermMalayalamDisplayMap *previous = previousTableMap;
+            if ([previous matchesParagraphRows:rows rowCount:_dataSource.numberOfLines columns:_dataSource.width
+                width:width sourceEols:eols sourceTexts:texts]) {
+                map = previous;
+            } else {
+                map = [[[iTermMalayalamDisplayMap alloc] initWithRows:rows rowCount:_dataSource.numberOfLines
+                    columns:_dataSource.width width:width sourceEols:eols sourceTexts:texts previousMap:previous] autorelease];
+            }
+            return;
+        }
+        iTermMalayalamDisplayMap *previous = previousTableMap;
+        if (!previous.paragraphFlowEnabled && [previous matchesRows:rows rowCount:_dataSource.numberOfLines columns:_dataSource.width width:width]) {
+            map = previous;
+        } else {
+            map = [[[iTermMalayalamDisplayMap alloc] initWithRows:rows rowCount:_dataSource.numberOfLines
+                columns:_dataSource.width width:width previousMap:previous] autorelease];
+        }
+    }];
+    return map;
+}
+
+- (CGFloat)malayalamFollowOrigin {
+    iTermMalayalamDisplayMap *map = _drawingHelper.malayalamDisplayMap;
+    CGFloat visibleHeight = NSHeight(self.enclosingScrollView.documentVisibleRect) - 2 * [iTermPreferences topBottomMargins];
+    NSInteger rows = MAX(1, floor(visibleHeight / _lineHeight));
+    NSInteger first = MAX(0, floor(NSMinY(self.enclosingScrollView.contentView.bounds) / _lineHeight));
+    iTermMalayalamDisplayFragment *caret = [map fragmentForColumn:_dataSource.cursorX - 1
+                                                     sourceRow:_dataSource.numberOfScrollbackLines + _dataSource.cursorY - 1];
+    if (caret) {
+        if (caret.displayRow < first) { first = caret.displayRow; }
+        if (caret.displayRow >= first + rows) { first = caret.displayRow - rows + 1; }
+    }
+    return MAX(0, MIN(first, map.displayRowCount - rows)) * _lineHeight;
+}
+
+- (NSPoint)malayalamViewPointForDisplayPoint:(NSPoint)point {
+    if (!_drawingHelper.malayalamDisplayMap) { return point; }
+    NSClipView *clip = self.enclosingScrollView.contentView;
+    NSRect viewport = [self convertRect:clip.bounds fromView:clip];
+    // The wrapper's margin shifts documentVisibleRect, but not the legacy renderer's display rows.
+    point.y += NSMinY(viewport) - NSMinY([self adjustedDocumentVisibleRect]);
+    return point;
+}
+
+- (BOOL)hasMalayalamDisplayMap {
+    return _drawingHelper.malayalamDisplayMap != nil;
+}
+
+- (int)sourceRowForMalayalamDisplayRow:(int)row {
+    return [_drawingHelper sourceRowForDisplayRow:row];
+}
+
+- (NSInteger)malayalamDisplayRowCount {
+    return _drawingHelper.malayalamDisplayMap ? _drawingHelper.malayalamDisplayMap.displayRowCount : _dataSource.numberOfLines;
+}
+
 - (CGFloat)desiredHeight {
     // Force the height to always be correct
-    return ([_dataSource numberOfLines] * _lineHeight +
+    return ([self malayalamDisplayRowCount] * _lineHeight +
             [self excess] +
             _drawingHelper.numberOfIMELines * _lineHeight);
 }
@@ -2482,14 +2747,15 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
 
 - (VT100GridRange)rangeOfVisibleLines {
     NSRect visibleRect = [self visibleContentRect];
-    int start = [self coordForPoint:visibleRect.origin allowRightMarginOverflow:NO].y;
-    int end = [self coordForPoint:NSMakePoint(0, NSMaxY(visibleRect) - 1) allowRightMarginOverflow:NO].y;
+    int start = [self gridCoordForPoint:visibleRect.origin allowRightMarginOverflow:NO].y;
+    int end = [self gridCoordForPoint:NSMakePoint(0, NSMaxY(visibleRect) - 1) allowRightMarginOverflow:NO].y;
     return VT100GridRangeMake(start, MAX(0, end - start + 1));
 }
 
 - (long long)firstVisibleAbsoluteLineNumber {
     NSRect visibleRect = [[self enclosingScrollView] documentVisibleRect];
-    long long firstVisibleLine = visibleRect.origin.y / _lineHeight;
+    if (_drawingHelper.malayalamDisplayMap) { visibleRect = self.enclosingScrollView.contentView.bounds; }
+    long long firstVisibleLine = [_drawingHelper sourceRowForDisplayRow:floor(visibleRect.origin.y / _lineHeight)];
     return firstVisibleLine + _dataSource.totalScrollbackOverflow;
 }
 
@@ -2606,6 +2872,26 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
 - (void)setFontTable:(iTermFontTable *)fontTable
    horizontalSpacing:(CGFloat)horizontalSpacing
      verticalSpacing:(CGFloat)verticalSpacing {
+    // Font-driven document resizing can constrain the clip before refresh sees it.
+    // Preserve the currently inspected source cell while the old geometry is still intact.
+    _malayalamFontAnchorPending = NO;
+    iTermMalayalamDisplayMap *map = _drawingHelper.malayalamDisplayMap;
+    const CGFloat oldLineHeight = _malayalamMapLineHeight > 0 ? _malayalamMapLineHeight : _lineHeight;
+    if (map && oldLineHeight > 0 && [iTermAdvancedSettingsModel malayalamVisualWrap] &&
+        [iTermAdvancedSettingsModel naturalRows] &&
+        [(PTYScroller *)self.enclosingScrollView.verticalScroller userScroll]) {
+        const CGFloat y = NSMinY(self.enclosingScrollView.contentView.bounds);
+        const int displayRow = MAX(0, floor(y / oldLineHeight));
+        if (_malayalamScrollAnchor.x < 0 || displayRow != _malayalamScrollAnchorDisplayRow) {
+            NSArray<iTermMalayalamDisplayFragment *> *fragments = map.fragments;
+            iTermMalayalamDisplayFragment *fragment = fragments[MIN(displayRow, (int)fragments.count - 1)];
+            NSPoint cell = [fragment sourceCellForLocalColumn:0].pointValue;
+            _malayalamScrollAnchor = VT100GridCoordMake(cell.x, cell.y);
+        }
+        _malayalamScrollAnchorDisplayRow = displayRow;
+        _malayalamFontAnchorFraction = (y - displayRow * oldLineHeight) / oldLineHeight;
+        _malayalamFontAnchorPending = YES;
+    }
     if (_fontTable != nil) {
         [[NSNotificationCenter defaultCenter] postNotificationName:PTYTextViewWillChangeFontNotification object:self];
     }
@@ -3027,21 +3313,21 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
 // Unconditionally set _marginColor to the currently correct value.
 - (VT100MarginColor)desiredMarginColor {
     const int width = _dataSource.width;
-    const int height = _dataSource.height;
+    const NSRange visibleLines = [self visibleRelativeRange];
 
     if (!_marginColorWidthBuffer) {
         _marginColorWidthBuffer = [[NSMutableData alloc] init];
     }
-    if (!_marginColorTwiceHeightBuffer) {
-        _marginColorTwiceHeightBuffer = [[NSMutableData alloc] init];
+    if (!_marginColorValuesBuffer) {
+        _marginColorValuesBuffer = [[NSMutableData alloc] init];
     }
     _marginColorWidthBuffer.length = sizeof(screen_char_t) * (width + 1);
-    _marginColorTwiceHeightBuffer.length = sizeof(screen_char_t) * height * 2;
+    // Paragraph flow can place more source rows than terminal rows in the visible range.
+    _marginColorValuesBuffer.length = sizeof(screen_char_t) * visibleLines.length * 2;
 
     // Collect the colors of the leftmost and rightmost cells on each row into values buffer.
     screen_char_t *buffer = (screen_char_t *)_marginColorWidthBuffer.mutableBytes;
-    screen_char_t *values = (screen_char_t *)_marginColorTwiceHeightBuffer.mutableBytes;
-    const NSRange visibleLines = [self visibleRelativeRange];
+    screen_char_t *values = (screen_char_t *)_marginColorValuesBuffer.mutableBytes;
     int numValues = 0;
     for (NSInteger i = 0; i < visibleLines.length; i++) {
         const int line = i + visibleLines.location;
@@ -3463,21 +3749,76 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
 - (BOOL)refreshAfterSync:(VT100SyncResult)syncResult {
     DLog(@"PTYTextView refreshAfterSync called with delegate %@", _delegate);
     if (_dataSource == nil || _delegate == nil || _inRefresh) {
+        _malayalamFontAnchorPending = NO;
         return YES;
     }
 
+    iTermMalayalamDisplayMap *previousMap = _drawingHelper.malayalamDisplayMap;
+    BOOL hadVisualWrap = previousMap != nil;
+    BOOL userScroll = [(PTYScroller *)self.enclosingScrollView.verticalScroller userScroll];
+    NSRect oldViewport = self.enclosingScrollView.contentView.bounds;
+    // Font changes install the new metrics before refresh; the old viewport still uses old geometry.
+    const CGFloat oldLineHeight = _malayalamMapLineHeight > 0 ? _malayalamMapLineHeight : _lineHeight;
+    int oldDisplayRow = oldLineHeight > 0 ? MAX(0, floor(NSMinY(oldViewport) / oldLineHeight)) : 0;
+    int anchorRow = [_drawingHelper sourceRowForDisplayRow:oldDisplayRow];
+    int anchorColumn = 0;
+    const BOOL useFontAnchor = _malayalamFontAnchorPending && userScroll && hadVisualWrap;
+    if (userScroll && hadVisualWrap && _malayalamScrollAnchor.x >= 0 &&
+        (useFontAnchor || oldDisplayRow == _malayalamScrollAnchorDisplayRow)) {
+        anchorRow = _malayalamScrollAnchor.y;
+        anchorColumn = _malayalamScrollAnchor.x;
+    } else if (hadVisualWrap) {
+        NSArray<iTermMalayalamDisplayFragment *> *fragments = _drawingHelper.malayalamDisplayMap.fragments;
+        iTermMalayalamDisplayFragment *fragment = fragments[MIN(oldDisplayRow, (int)fragments.count - 1)];
+        NSPoint cell = [fragment sourceCellForLocalColumn:0].pointValue;
+        anchorRow = cell.y;
+        anchorColumn = cell.x;
+    }
+    // Non-resetting API syncs can report the same overflow again on the next refresh.
+    const long long mapOverflow = _malayalamMapScrollbackOverflow < 0 ? 0 :
+        _dataSource.totalScrollbackOverflow - _malayalamMapScrollbackOverflow;
+    if (mapOverflow < 0 || mapOverflow > anchorRow) {
+        // The inspected row was evicted, or the terminal's absolute-row epoch was reset.
+        anchorRow = 0;
+        anchorColumn = 0;
+    } else {
+        anchorRow -= (int)mapOverflow;
+    }
+    const CGFloat anchorFraction = useFontAnchor ? _malayalamFontAnchorFraction : (oldLineHeight > 0 ?
+        (NSMinY(oldViewport) - oldDisplayRow * oldLineHeight) / oldLineHeight : 0);
+    _malayalamFontAnchorPending = NO;
+    [self updateMalayalamDisplayMap];
+    if (previousMap != _drawingHelper.malayalamDisplayMap) { [self requestDelegateRedraw]; }
     const int scrollbackOverflow = syncResult.overflow;
     const BOOL frameDidChange = [_delegate textViewResizeFrameIfNeeded];
+    if (userScroll && (hadVisualWrap || _drawingHelper.malayalamDisplayMap)) {
+        // Preserve the inspected source cell, not its obsolete visual-row ordinal.
+        NSClipView *clip = self.enclosingScrollView.contentView;
+        NSPoint origin = clip.bounds.origin;
+        origin.y = [_drawingHelper displayYForColumn:anchorColumn sourceRow:anchorRow] + anchorFraction * _lineHeight;
+        NSRect proposedBounds = clip.bounds;
+        proposedBounds.origin = origin;
+        origin = [clip constrainBoundsRect:proposedBounds].origin;
+        const BOOL clamped = !NSEqualPoints(origin, proposedBounds.origin);
+        [clip scrollToPoint:origin];
+        [self.enclosingScrollView reflectScrolledClipView:clip];
+        _malayalamScrollAnchor = clamped ? VT100GridCoordMake(-1, -1) :
+            VT100GridCoordMake(anchorColumn, anchorRow);
+        _malayalamScrollAnchorDisplayRow = floor(NSMinY(clip.bounds) / _lineHeight);
+    }
+    if (!userScroll || !_drawingHelper.malayalamDisplayMap) {
+        _malayalamScrollAnchor = VT100GridCoordMake(-1, -1);
+    }
 
     assert(_delegate != nil);
 
     // Perform adjustments if lines were lost from the head of the buffer.
-    BOOL userScroll = [(PTYScroller*)([[self enclosingScrollView] verticalScroller]) userScroll];
     if (scrollbackOverflow > 0) {
         // -selectionDidChange might get called here, which calls -refresh.
         // Keeping this function safely reentrant is just too difficult.
         _inRefresh = YES;
-        [self handleScrollbackOverflow:scrollbackOverflow userScroll:userScroll];
+        [self handleScrollbackOverflow:scrollbackOverflow
+                           userScroll:userScroll && !(hadVisualWrap || _drawingHelper.malayalamDisplayMap)];
         _inRefresh = NO;
     }
 
@@ -5760,6 +6101,10 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
     }
     NSPoint localPoint = [self convertPoint:[[self window] convertPointFromScreen:thePoint]
                                    fromView:nil];
+    if ([iTermAdvancedSettingsModel naturalRows]) {
+        const VT100GridCoord coord = [self coordForPoint:localPoint allowRightMarginOverflow:NO];
+        return (NSUInteger)(coord.x + (coord.y + _dataSource.totalScrollbackOverflow) * width);
+    }
     const int x = (int)((localPoint.x - [iTermPreferences sideMargins]) / _charWidth);
     const int line = (int)(localPoint.y / _lineHeight);
     const int clampedLine = MAX(0, MIN(line, [_dataSource numberOfLines] - 1));
@@ -5790,6 +6135,29 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
                              (y + [_dataSource numberOfLines] - [_dataSource height] + 1) * _lineHeight,
                              _charWidth * firstLineLength,
                              _lineHeight);
+    if ([iTermAdvancedSettingsModel naturalRows]) {
+        const int row = y + _dataSource.numberOfScrollbackLines;
+        NSNumber *left = [self.drawingHelper malayalamXForColumn:x line:row];
+        NSNumber *right = [self.drawingHelper malayalamXForColumn:x + (int)firstLineLength line:row];
+        iTermMalayalamDisplayFragment *fragment = [_drawingHelper.malayalamDisplayMap fragmentForColumn:x sourceRow:row];
+        if (fragment.layout && [fragment localColumn:x sourceRow:row]) {
+            // This API returns the first visual rectangle, not a rectangle across wrapped fragments.
+            NSNumber *local = [fragment localColumn:x sourceRow:row];
+            iTermMalayalamCellProjection *start = local ? [fragment.layout projectionAtColumn:local.integerValue] : nil;
+            NSInteger endColumn = MIN(local.integerValue + firstLineLength, fragment.layout.cellUTF16Boundaries.count - 1);
+            iTermMalayalamCellProjection *end = local ? [fragment.layout projectionAtColumn:endColumn] : nil;
+            left = start.nativeEdge ? @([iTermPreferences sideMargins] + fragment.originX + start.nativeEdge.x) : nil;
+            right = end.nativeEdge ? @([iTermPreferences sideMargins] + fragment.originX + end.nativeEdge.x) : nil;
+        }
+        if (_drawingHelper.malayalamDisplayMap) {
+            rect.origin.y = [self malayalamViewPointForDisplayPoint:NSMakePoint(0,
+                [_drawingHelper displayYForColumn:x sourceRow:row])].y + _lineHeight;
+        }
+        if (left && right) {
+            rect.origin.x = MIN(left.doubleValue, right.doubleValue);
+            rect.size.width = MAX(2, fabs(right.doubleValue - left.doubleValue));
+        }
+    }
     rect.origin = [[self window] pointToScreenCoords:[self convertPoint:rect.origin toView:nil]];
     if (actualRange) {
         *actualRange = theRange;
@@ -5992,6 +6360,28 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
 }
 
 - (void)findOnPageRevealRange:(VT100GridCoordRange)range {
+    if (_drawingHelper.malayalamDisplayMap) {
+        VT100GridCoord last = range.end;
+        // Find ranges have an exclusive end; reveal the last matched cell, not the next fragment.
+        if (last.y > range.start.y || last.x > range.start.x) {
+            if (last.x > 0) {
+                last.x--;
+            } else {
+                last.y--;
+                last.x = _dataSource.width - 1;
+            }
+        }
+        const NSRect firstRect = [self rectForCoord:range.start];
+        const NSRect lastRect = [self rectForCoord:last];
+        const NSRect visible = self.visibleRect;
+        if (NSMinY(firstRect) < NSMinY(visible) || NSMaxY(lastRect) > NSMaxY(visible)) {
+            [self cancelMomentumScroll];
+            [self lockScroll];
+            [self scrollToCenterY:NSMinY(lastRect)];
+        }
+        [self requestDelegateRedraw];
+        return;
+    }
     const VT100GridRange visibleLines = [self rangeOfVisibleLines];
     const VT100GridCoordRange visibleRange = VT100GridCoordRangeMake(0,
                                                                      visibleLines.location,
@@ -6123,6 +6513,13 @@ extendResultsAcrossSoftBoundaries:(BOOL)extendResultsAcrossSoftBoundaries {
 #pragma mark - Find Cursor
 
 - (NSRect)rectForCoord:(VT100GridCoord)coord {
+    if (_drawingHelper.malayalamDisplayMap) {
+        NSNumber *x = [_drawingHelper malayalamXForColumn:coord.x line:coord.y];
+        NSPoint point = [self malayalamViewPointForDisplayPoint:NSMakePoint(
+            x ? x.doubleValue : [iTermPreferences sideMargins] + coord.x * _charWidth,
+            [_drawingHelper displayYForColumn:coord.x sourceRow:coord.y])];
+        return NSMakeRect(point.x, point.y, _charWidth, _lineHeight);
+    }
     return NSMakeRect([iTermPreferences sideMargins] + coord.x * _charWidth,
                       coord.y * _lineHeight,
                       _charWidth,
@@ -6324,6 +6721,9 @@ extendResultsAcrossSoftBoundaries:(BOOL)extendResultsAcrossSoftBoundaries {
     if (selection != _selection && selection != _oldSelection) {
         DLog(@"Not my selection. Ignore it.");
         return;
+    }
+    if (selection == _selection && !_selection.live) {
+        _drawingHelper.malayalamInspectionCell = VT100GridAbsCoordMake(-1, -1);
     }
     [[NSNotificationCenter defaultCenter] postNotificationName:PTYTextViewSelectionDidChangeNotification
                                                         object:self];
@@ -6668,6 +7068,25 @@ extendResultsAcrossSoftBoundaries:(BOOL)extendResultsAcrossSoftBoundaries {
 
 - (const screen_char_t *)drawingHelperLineAtIndex:(int)line {
     return [_dataSource screenCharArrayForLine:line].line;
+}
+
+- (ScreenCharArray *)drawingHelperRowAtIndex:(int)line {
+    return [[_dataSource screenCharArrayForLine:line] clone];
+}
+
+- (iTermRowContentIdentity)drawingHelperContentIdentityAtIndex:(int)line {
+    if ([_dataSource respondsToSelector:@selector(contentIdentityForLine:)]) {
+        return [(VT100Screen *)_dataSource contentIdentityForLine:line];
+    }
+    return (iTermRowContentIdentity){ 0 };
+}
+
+- (ScreenCharArray *)drawingHelperRowAtIndex:(int)line contentIdentity:(out iTermRowContentIdentity *)identity {
+    if ([_dataSource respondsToSelector:@selector(screenCharArrayForLine:contentIdentity:)]) {
+        return [[(VT100Screen *)_dataSource screenCharArrayForLine:line contentIdentity:identity] clone];
+    }
+    *identity = (iTermRowContentIdentity){ 0 };
+    return [self drawingHelperRowAtIndex:line];
 }
 
 - (id<iTermExternalAttributeIndexReading>)drawingHelperExternalAttributesOnLine:(int)lineNumber {
@@ -7466,6 +7885,14 @@ static NSString *iTermStringFromRange(NSRange range) {
                                MAX(0, coordRange.start.y * _lineHeight),
                                MAX(0, spanWidth * _charWidth),
                                MAX(0, (coordRange.end.y - coordRange.start.y + 1) * _lineHeight));
+    if ([iTermAdvancedSettingsModel naturalRows] && coordRange.start.y == coordRange.end.y) {
+        NSNumber *left = [self.drawingHelper malayalamXForColumn:coordRange.start.x line:coordRange.start.y];
+        NSNumber *right = [self.drawingHelper malayalamXForColumn:coordRange.end.x line:coordRange.end.y];
+        if (left && right) {
+            result.origin.x = MIN(left.doubleValue, right.doubleValue);
+            result.size.width = MAX(2, fabs(right.doubleValue - left.doubleValue));
+        }
+    }
     result = [self convertRect:result toView:nil];
     result = [self.window convertRectToScreen:result];
     return result;
@@ -8286,6 +8713,11 @@ static NSString *iTermStringFromRange(NSRange range) {
 }
 
 - (VT100GridCoord)mouseHandlerCoordForPointInView:(NSPoint)point {
+    if ([iTermAdvancedSettingsModel naturalRows]) {
+        VT100GridCoord coord = [self coordForPoint:point allowRightMarginOverflow:NO reportingMouseCell:YES];
+        coord.y = MAX(0, coord.y - _dataSource.numberOfScrollbackLines);
+        return coord;
+    }
     NSRect liveRect = [self liveRect];
     VT100GridCoord coord = VT100GridCoordMake((point.x - liveRect.origin.x) / _charWidth,
                                               (point.y - liveRect.origin.y) / _lineHeight);
@@ -8310,6 +8742,15 @@ static NSString *iTermStringFromRange(NSRange range) {
 - (BOOL)mouseHandler:(PTYMouseHandler *)handler viewCoordIsReportable:(NSPoint)point {
     const NSRect liveRect = [self liveRect];
     DLog(@"Point in view is %@, live rect is %@", NSStringFromPoint(point), NSStringFromRect(liveRect));
+    if ([iTermAdvancedSettingsModel naturalRows]) {
+        if (!NSPointInRect(point, self.visibleRect)) { return NO; }
+        const VT100GridCoord source = [self coordForPoint:point
+                               allowRightMarginOverflow:NO
+                                     reportingMouseCell:YES];
+        const NSInteger activeRow = source.y - _dataSource.numberOfScrollbackLines;
+        return point.x >= NSMinX(liveRect) && point.x < NSMaxX(liveRect) &&
+               activeRow >= 0 && activeRow < _dataSource.height;
+    }
     return NSPointInRect(point, liveRect);
 }
 

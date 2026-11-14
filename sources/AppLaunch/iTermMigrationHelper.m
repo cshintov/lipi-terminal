@@ -78,6 +78,10 @@
 }
 
 + (void)migrateApplicationSupportDirectoryIfNeeded {
+#if LIPI_TERMINAL
+    // The legacy iTerm directory belongs to another application, even when empty.
+    return;
+#else
     NSFileManager *fileManager = [NSFileManager defaultManager];
     NSString *modern = [fileManager applicationSupportDirectory];
     NSString *legacy = [fileManager legacyApplicationSupportDirectory];
@@ -163,6 +167,7 @@
                 break;
         }
     }
+#endif
 }
 
 + (void)copyProfileToBookmark:(NSMutableDictionary *)dict

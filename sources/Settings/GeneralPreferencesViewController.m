@@ -2555,6 +2555,13 @@ objectValueForTableColumn:(NSTableColumn *)tableColumn
             relatedView:nil
                    type:kPreferenceInfoTypeCheckbox];
 
+#if LIPI_TERMINAL
+    _checkUpdate.hidden = YES;
+    _checkUpdate.enabled = NO;
+    _checkTestRelease.hidden = YES;
+    _checkTestRelease.enabled = NO;
+    _nightlyBuildNotice.hidden = YES;
+#else
     [self defineControl:_checkUpdate
                     key:kPreferenceKeyCheckForUpdatesAutomatically
             relatedView:nil
@@ -2569,6 +2576,7 @@ objectValueForTableColumn:(NSTableColumn *)tableColumn
             relatedView:nil
                    type:kPreferenceInfoTypeCheckbox];
 
+#endif
     // ---------------------------------------------------------------------------------------------
     info = [self defineControl:_useCustomScriptsFolder
                            key:kPreferenceKeyUseCustomScriptsFolder

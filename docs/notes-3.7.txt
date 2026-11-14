@@ -5,6 +5,10 @@ right-to-left rendering, selection, and copy
 improvements in this release.
 
 Major New Features:
+- Lipi Terminal adds opt-in natural Malayalam
+  and Hindi text, with shaped selection and
+  wrapping. See the fork README for setup and
+  known compatibility limits.
 - Support for the Program Status Protocol
   (OSC 7501), which lets a program report that it
   is working, waiting on you, done, or failed.
@@ -665,6 +669,8 @@ Improvements:
   stays responsive while output streams.
 
 Bug Fixes:
+- Refresh the visible screen after clearing
+  scrollback while scrolled into history.
 - If iTerm2 quits unexpectedly while tmux
   integration is attached, and you switched to
   another app at some point after attaching,

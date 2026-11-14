@@ -140,6 +140,65 @@ final class iTermRowCacheIdentityTests: XCTestCase {
         }
     }
 
+    // Exercise the cache contract across short frame/event sequences, rather
+    // than only checking that generations differ within one dirty snapshot.
+    func testAllDirtyScrollSequencesNeverReuseIdentityForDifferentContent() {
+        enum Event: CaseIterable { case scroll, clean, redraw, copy, edit }
+        let events = Event.allCases
+        let sequences = events.flatMap { first in
+            events.flatMap { second in events.map { [first, second, $0] } }
+        }
+        for sequence in sequences {
+            let grid = makeGrid()
+            for y in Int32(0)..<3 {
+                var cell = screen_char_t()
+                cell.code = UInt16(65 + y)
+                grid.setCharsFrom(VT100GridCoord(x: 0, y: y),
+                                  to: VT100GridCoord(x: 4, y: y),
+                                  to: cell, externalAttributes: nil)
+            }
+            grid.markAllCharsDirty(false, updateTimestamps: false)
+            grid.isAllDirty = true
+            let history = LineBuffer(blockSize: 1000)
+            let mirror = makeGrid()
+            var cache = [Int64: Data]()
+            func check(_ snapshot: VT100Grid) {
+                for y in Int32(0)..<3 {
+                    let identity = snapshot.generation(forLine: y)
+                    let content = Data(bytes: snapshot.screenChars(atLineNumber: y)!,
+                                       count: 6 * MemoryLayout<screen_char_t>.stride)
+                    if let cached = cache[identity] {
+                        XCTAssertEqual(cached, content,
+                            "stale cached row in \(sequence), row \(y)")
+                    }
+                    cache[identity] = content
+                }
+            }
+            check(grid)
+            for event in sequence {
+                switch event {
+                case .scroll:
+                    _ = grid.scrollWholeScreenUp(into: history, unlimitedScrollback: true)
+                case .clean:
+                    grid.markAllCharsDirty(false, updateTimestamps: false)
+                case .redraw:
+                    grid.isAllDirty = true
+                case .copy:
+                    check(grid.copy() as! VT100Grid)
+                case .edit:
+                    var cell = screen_char_t()
+                    cell.code = 90
+                    grid.setCharsFrom(VT100GridCoord(x: 1, y: 1),
+                                      to: VT100GridCoord(x: 1, y: 1),
+                                      to: cell, externalAttributes: nil)
+                }
+                check(grid)
+                mirror.copyDirty(from: grid, didScroll: true)
+                check(mirror)
+            }
+        }
+    }
+
     // MARK: - iTermColorMap generation propagates on copy
 
     func testColorMapCopyPreservesGeneration() {

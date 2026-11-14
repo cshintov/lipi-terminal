@@ -15,6 +15,8 @@
 #import "iTerm2SharedARC-Swift.h"
 #import "iTermAdvancedSettingsModel.h"
 #import "iTermAttributedStringBuilder.h"
+#import "iTermConfigGenerationTracker.h"
+#import "iTermRowOutputCache.h"
 #import "iTermCursorBlinkFadeAnimator.h"
 #import "iTermAttributedStringProxy.h"
 #import "iTermBackgroundColorRun.h"
@@ -48,6 +50,7 @@
 #import "RegexKitLite.h"
 #import "ScreenCharArray.h"
 #import "VT100ScreenMark.h"
+#import "VT100LineInfo.h"
 #import "VT100Terminal.h"  // TODO: Remove this dependency
 
 #define MEDIAN(min_, mid_, max_) MAX(MIN(mid_, max_), min_)
@@ -109,7 +112,22 @@ BOOL CheckFindMatchAtIndex(NSData *findMatches, int index) {
     return !!(theIndex < [findMatches length] && (matchBytes[theIndex] & mask));
 }
 
+// Structurally eligible nil-layout rows keep one grid fragment; failed table preparation aborts the map.
+@interface iTermMalayalamPreparedRow : NSObject
+@property(nonatomic) BOOL mapEligible;
+@property(nonatomic) int sourceEol;
+@property(nonatomic, copy) NSString *sourceText;
+@property(nonatomic, strong) iTermMalayalamRowLayout *layout;
+@property(nonatomic, strong) iTermMalayalamTableSource *tableSource;
+@end
+@implementation iTermMalayalamPreparedRow
+@end
+
 @interface iTermTextDrawingHelper() <iTermCursorDelegate, iTermAttributedStringBuilderDelegate>
+- (NSRect)malayalamNativeBoundsForRange:(NSRange)range layout:(iTermMalayalamRowLayout *)layout;
+- (iTermMalayalamRowLayout *)prepareMalayalamLayoutAtLine:(int)line row:(ScreenCharArray *)row
+                                                matches:(NSData *)matches selected:(NSIndexSet *)selected
+                                        allowASCIITable:(BOOL)allowASCIITable;
 @end
 
 enum {
@@ -143,6 +161,19 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
                                                                          CGFloat transparencyAlpha,
                                                                          CGFloat blend);
 @implementation iTermTextDrawingHelper {
+    NSMutableDictionary<NSNumber *, iTermMalayalamRowLayout *> *_malayalamRows;
+    iTermMalayalamPreparedRow *_malayalamLastPreparedRow;
+    NSInteger _malayalamPreviousSourceRowShift;
+    NSMutableDictionary<NSData *, iTermMalayalamPreparedRow *> *_malayalamSourceRows;
+    NSMutableDictionary<NSData *, iTermMalayalamPreparedRow *> *_malayalamNextSourceRows;
+    iTermConfigGenerationTracker *_malayalamConfigTracker;
+    uint64_t _malayalamConfigGeneration;
+    BOOL _malayalamGenerationTrackingEnabled;
+    NSUInteger _naturalRowModes;
+    NSString *_naturalRowHindiFont;
+    CGFloat _malayalamCacheMinimumContrast;
+    NSSize _malayalamCacheCellSize;
+    NSMutableDictionary<NSString *, NSString *> *_malayalamTraceStates;
     NSFont *_cachedFont;
     CGFontRef _cgFont;
 
@@ -175,6 +206,7 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
 
     NSSize _scrollViewContentSize;
     NSRect _scrollViewDocumentVisibleRect;
+    NSValue *_offscreenRenderedRows;
 
     // Pattern for background stripes
     NSImage *_backgroundStripesImage;
@@ -196,9 +228,14 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
     NSInteger _cachedMarksColorMapGeneration;
 }
 
+@synthesize malayalamDisplayMap = _malayalamDisplayMap;
+
 - (instancetype)init {
     self = [super init];
     if (self) {
+        // A fresh offscreen helper may inherit a valid map before its first setup.
+        [self invalidateNaturalRowCachesForModeChange];
+        _malayalamInspectionCell = VT100GridAbsCoordMake(-1, -1);
         _hdrCursorBrightness = iTermHDRCursorMaximumBrightness;
         iTermPreciseTimerStatsInit(&_stats[TIMER_TOTAL_DRAW_RECT], "Total drawRect");
         iTermPreciseTimerStatsInit(&_stats[TIMER_CONSTRUCT_BACKGROUND_RUNS], "Construct BG runs");
@@ -251,7 +288,764 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
 
 #pragma mark - Drawing: General
 
+- (void)traceMalayalamRow:(int)row layout:(iTermMalayalamRowLayout *)layout event:(NSString *)event {
+    const char *enabled = getenv("ITERM2_MALAYALAM_TRACE");
+    if (!enabled || strcmp(enabled, "1")) { return; }
+    NSMutableSet<NSString *> *fonts = [NSMutableSet set];
+    if (layout) {
+        for (id run in (__bridge NSArray *)CTLineGetGlyphRuns(layout.line)) {
+            NSDictionary *attributes = (__bridge NSDictionary *)CTRunGetAttributes((__bridge CTRunRef)run);
+            CTFontRef font = (__bridge CTFontRef)attributes[(NSString *)kCTFontAttributeName];
+            if (font) {
+                [fonts addObject:[NSString stringWithFormat:@"%@@%.3f",
+                    CFBridgingRelease(CTFontCopyPostScriptName(font)), CTFontGetSize(font)]];
+            }
+        }
+    }
+    iTermMalayalamCellProjection *caret = [layout projectionAtColumn:_cursorCoord.x];
+    const NSUInteger selected = [_selection selectedIndexesOnAbsoluteLine:row + _totalScrollbackOverflow].count;
+    CGFloat ascent = 0, descent = 0, leading = 0;
+    CGRect ink = CGRectZero;
+    if (layout) {
+        CTLineGetTypographicBounds(layout.line, &ascent, &descent, &leading);
+        ink = CTLineGetBoundsWithOptions(layout.line, kCTLineBoundsUseGlyphPathBounds);
+    }
+    NSString *state = [NSString stringWithFormat:@"%@ row=%d width=%.6f gridSpan=%.6f utf16=%lu fonts=%@ cursor=%d caretKind=%ld anchor=%ld x=%@ selectedCells=%lu cellHeight=%.6f baselineFromTop=%.6f ascent=%.6f descent=%.6f leading=%.6f ink=%@ asciiAA=%d nonAsciiAA=%d retina=%d forceRetinaAA=%d",
+        event, row, layout.naturalWidth, _gridSize.width * _cellSize.width,
+        (unsigned long)layout.attributedString.length, [[fonts allObjects] sortedArrayUsingSelector:@selector(compare:)],
+        _cursorCoord.x, (long)(caret ? caret.kind : iTermMalayalamCaretKindUnresolved),
+        (long)caret.anchorUTF16Index, caret.nativeEdge ? @(caret.nativeEdge.x) : @"unresolved", (unsigned long)selected,
+        _cellSize.height, _baselineOffset + _cellSize.height, ascent, descent, leading,
+        NSStringFromRect(NSRectFromCGRect(ink)), _asciiAntiAlias, _nonAsciiAntiAlias, _isRetina, _forceAntialiasingOnRetina];
+    if (!_malayalamTraceStates) { _malayalamTraceStates = [NSMutableDictionary dictionary]; }
+    NSString *key = [NSString stringWithFormat:@"%d:%@", row, event];
+    if (![_malayalamTraceStates[key] isEqualToString:state]) {
+        if (_malayalamTraceStates.count > 256) { [_malayalamTraceStates removeAllObjects]; }
+        _malayalamTraceStates[key] = state;
+        // Only opted-in geometry/metadata, never terminal text or preference contents.
+        fprintf(stderr, "ML_ROW %s\n", state.UTF8String);
+    }
+}
+
+- (NSUInteger)malayalamRowLayoutBuildCount {
+    return _attributedStringBuilder.malayalamRowLayoutBuildCount;
+}
+
+- (NSUInteger)malayalamRowLayoutPreparationCount {
+    return _attributedStringBuilder.malayalamRowLayoutPreparationCount;
+}
+
+- (BOOL)rowContainsMalayalam:(ScreenCharArray *)row {
+    const BOOL malayalamEnabled = [iTermAdvancedSettingsModel malayalamNaturalRows];
+    const BOOL hindiEnabled = [iTermAdvancedSettingsModel hindiNaturalRows];
+    // NUL cells are gaps, not a terminator. Complex cells can contain enabled-script marks.
+    for (int column = 0; column < row.length; column++) {
+        screen_char_t cell = row.line[column];
+        if (!cell.complexChar) {
+            if (iTermIsNaturalRowCodePoint(cell.code, malayalamEnabled, hindiEnabled)) { return YES; }
+            continue;
+        }
+        NSString *text = ScreenCharToStr(&cell);
+        for (NSUInteger index = 0; index < text.length; index++) {
+            unichar scalar = [text characterAtIndex:index];
+            if (iTermIsNaturalRowCodePoint(scalar, malayalamEnabled, hindiEnabled)) { return YES; }
+        }
+    }
+    return NO;
+}
+
+- (iTermMalayalamTableSource *)malayalamPreparedTableSource {
+    return _malayalamLastPreparedRow.tableSource;
+}
+
+- (void)invalidateNaturalRowCachesForModeChange {
+    const NSUInteger modes = ([iTermAdvancedSettingsModel malayalamNaturalRows] ? 1 : 0) |
+        ([iTermAdvancedSettingsModel hindiNaturalRows] ? 2 : 0);
+    NSString *hindiFont = (modes & 2) ? [iTermAdvancedSettingsModel hindiNaturalRowsFont] : @"";
+    if (modes == _naturalRowModes && [hindiFont isEqualToString:_naturalRowHindiFont]) { return; }
+    _naturalRowModes = modes;
+    _naturalRowHindiFont = [hindiFont copy];
+    // Both positive and negative admission, plus mode-dependent prose/table facts, are stale.
+    _malayalamSourceRows = nil;
+    _malayalamNextSourceRows = nil;
+    _malayalamLastPreparedRow = nil;
+    _malayalamRows = nil;
+    _malayalamDisplayMap = nil;
+    _malayalamPreviousSourceRowShift = 0;
+}
+
+- (iTermMalayalamDisplayMap *)malayalamDisplayMap {
+    [self invalidateNaturalRowCachesForModeChange];
+    return _malayalamDisplayMap;
+}
+
+- (void)beginMalayalamMapPassWithPreviousSourceRowShift:(NSInteger)shift {
+    [self invalidateNaturalRowCachesForModeChange];
+    _malayalamPreviousSourceRowShift = MAX(0, shift);
+    _malayalamNextSourceRows = [NSMutableDictionary dictionary];
+}
+
+- (void)endMalayalamMapPass {
+    _malayalamPreviousSourceRowShift = 0;
+    _malayalamSourceRows = _malayalamNextSourceRows;
+    _malayalamNextSourceRows = nil;
+}
+
+- (iTermMalayalamRowLayout *)malayalamLayoutAtLine:(int)line {
+    BOOL eligible = NO;
+    return [self malayalamLayoutAtLine:line mapEligible:&eligible];
+}
+
+- (iTermMalayalamRowLayout *)malayalamLayoutAtLine:(int)line mapEligible:(BOOL *)eligible
+                                      sourceEol:(int *)eol sourceText:(NSString **)sourceText {
+    iTermMalayalamRowLayout *layout = [self malayalamLayoutAtLine:line mapEligible:eligible];
+    *eol = _malayalamLastPreparedRow.sourceEol;
+    *sourceText = _malayalamLastPreparedRow.sourceText ?: @"";
+    return layout;
+}
+
+- (iTermMalayalamRowLayout *)malayalamLayoutAtLine:(int)line mapEligible:(BOOL *)eligible {
+    [self invalidateNaturalRowCachesForModeChange];
+    _malayalamLastPreparedRow = nil;
+    *eligible = NO;
+    if (![iTermAdvancedSettingsModel naturalRows] || line < 0 || line >= _numberOfLines ||
+        [self hasMarkedText] || _hasBackgroundImage || _offscreenCommandLine) { return nil; }
+    NSData *matches = [_delegate drawingHelperMatchesOnLine:line];
+    NSIndexSet *selected = [_selection selectedIndexesOnAbsoluteLine:line + _totalScrollbackOverflow];
+    // Match Metal's overlay policy: never retain selection/find/hover/annotation paint as a clean baseline.
+    BOOL cacheable = (_malayalamGenerationTrackingEnabled && _fontTable != nil && !selected.count && matches == nil &&
+        [self underlinedRangeOnLine:line + _totalScrollbackOverflow].length == 0 &&
+        ![_delegate drawingHelperCharactersWithNotesOnLine:line].count && [self canDrawLine:line]);
+    iTermRowCacheKey key;
+    memset(&key, 0, sizeof(key));
+    key.configGeneration = _malayalamConfigGeneration;
+    if ([_delegate respondsToSelector:@selector(drawingHelperContentIdentityAtIndex:)]) {
+        key.contentIdentity = [_delegate drawingHelperContentIdentityAtIndex:line];
+    }
+    cacheable &= key.contentIdentity.generation != iTermRowContentGenerationUncacheable;
+    NSData *boxedKey = cacheable ? [NSData dataWithBytes:&key length:sizeof(key)] : nil;
+    iTermMalayalamPreparedRow *cached = boxedKey ? _malayalamSourceRows[boxedKey] : nil;
+    BOOL proseMetadata = [iTermAdvancedSettingsModel malayalamParagraphFlow];
+    if (cached && (!proseMetadata || cached.sourceText != nil)) {
+        _malayalamLastPreparedRow = cached;
+        if (_malayalamNextSourceRows) { _malayalamNextSourceRows[boxedKey] = cached; }
+        *eligible = cached.mapEligible;
+        return cached.layout;
+    }
+    NS_VALID_UNTIL_END_OF_SCOPE ScreenCharArray *row;
+    if ([_delegate respondsToSelector:@selector(drawingHelperRowAtIndex:contentIdentity:)]) {
+        row = [_delegate drawingHelperRowAtIndex:line contentIdentity:&key.contentIdentity];
+    } else {
+        row = [_delegate drawingHelperRowAtIndex:line];
+        key.contentIdentity.generation = iTermRowContentGenerationUncacheable;
+    }
+    if (!row) { return nil; }
+    BOOL sourceEligible = row.length == _gridSize.width && _gridSize.width > 0 &&
+        !row.metadata.rtlFound && row.metadata.lineAttribute == iTermLineAttributeSingleWidth;
+    for (int column = 0; sourceEligible && column < row.length; column++) {
+        if (row.line[column].image) { sourceEligible = NO; }
+    }
+    BOOL containsMalayalam = sourceEligible && [self rowContainsMalayalam:row];
+    int first = 0;
+    while (first < row.length && (row.line[first].code == 0 || row.line[first].code == ' ')) { first++; }
+    const unichar leading = first < row.length ? row.line[first].code : 0;
+    BOOL tableCandidate = sourceEligible && (leading == 0x2502 || leading == 0x250c ||
+        leading == 0x251c || leading == 0x2514);
+    iTermMalayalamRowLayout *prepared = (containsMalayalam || tableCandidate) ?
+        [self prepareMalayalamLayoutAtLine:line row:row matches:matches selected:selected allowASCIITable:tableCandidate] : nil;
+    iTermMalayalamRowLayout *layout = containsMalayalam ? prepared : nil;
+    *eligible = sourceEligible && (!tableCandidate || prepared != nil);
+    iTermMalayalamPreparedRow *record = nil;
+    if (tableCandidate || proseMetadata || (cacheable && key.contentIdentity.generation != iTermRowContentGenerationUncacheable)) {
+        record = [[iTermMalayalamPreparedRow alloc] init];
+        record.mapEligible = *eligible;
+        record.layout = layout;
+        if (tableCandidate && prepared) {
+            NSMutableIndexSet *padding = [NSMutableIndexSet indexSet];
+            for (int column = 0; column < row.length; column++) {
+                const screen_char_t cell = row.line[column];
+                if (!cell.complexChar && (cell.code == 0 ||
+                    (cell.code == ' ' && !cell.underline && !cell.bold && !cell.italic))) {
+                    [padding addIndex:column];
+                }
+            }
+            record.tableSource = [[iTermMalayalamTableSource alloc] initWithLayout:prepared paddingColumns:padding];
+        }
+        // Canonical generation includes continuation-cell mutations as well as visible cells.
+        record.sourceEol = row.eol;
+        if (proseMetadata) { record.sourceText = row.stringValueIncludingEmbeddedNulls ?: @""; }
+        _malayalamLastPreparedRow = record;
+    }
+    if (cacheable && key.contentIdentity.generation != iTermRowContentGenerationUncacheable) {
+        boxedKey = [NSData dataWithBytes:&key length:sizeof(key)];
+        if (_malayalamNextSourceRows) {
+            _malayalamNextSourceRows[boxedKey] = record;
+        } else {
+            if (!_malayalamSourceRows || _malayalamSourceRows.count > (NSUInteger)MAX(256, _numberOfLines)) {
+                _malayalamSourceRows = [NSMutableDictionary dictionary];
+            }
+            _malayalamSourceRows[boxedKey] = record;
+        }
+    }
+    return layout;
+}
+
+- (iTermMalayalamRowLayout *)prepareMalayalamLayoutAtLine:(int)line row:(ScreenCharArray *)row
+                                                matches:(NSData *)matches selected:(NSIndexSet *)selected
+                                        allowASCIITable:(BOOL)allowASCIITable {
+    iTermMalayalamRowLayout *previous = nil;
+    const NSInteger shift = _malayalamPreviousSourceRowShift;
+    // Retained history has lower row numbers now; prefer its old map row over a stale logical slot.
+    if (shift > 0 && line >= 0 && line < _numberOfScrollbackLines &&
+        shift < _malayalamDisplayMap.sourceRowCount && line < _malayalamDisplayMap.sourceRowCount - shift) {
+        previous = [_malayalamDisplayMap sourceLayoutForRow:(NSInteger)line + shift];
+    }
+    if (!previous) {
+        previous = _malayalamRows[@(line)] ?: [_malayalamDisplayMap sourceLayoutForRow:line];
+    }
+    BOOL blink = NO;
+    iTermBackgroundColorRunsInLine *runs = [iTermBackgroundColorRunsInLine
+        backgroundRunsInLine:row.line lineLength:row.length sourceLineNumber:line displayLineNumber:line
+        selectedIndexes:selected withinRange:NSMakeRange(0, row.length) matches:matches anyBlink:&blink
+        y:line * _cellSize.height bidi:nil eaIndex:row.eaIndex darkMode:_colorMap.backgroundIsDark];
+    NSString *reason = nil;
+    iTermMalayalamRowLayout *candidate = [_attributedStringBuilder
+        malayalamLayoutForRow:row expectedWidth:_gridSize.width
+        backgroundRuns:runs.array findMatches:matches previousLayout:previous
+        reason:&reason allowASCIITable:allowASCIITable];
+    if (!candidate) {
+        [_malayalamRows removeObjectForKey:@(line)];
+        [self traceMalayalamRow:line layout:nil event:[@"fallback-" stringByAppendingString:reason ?: @"unresolved"]];
+        return nil;
+    }
+    if (candidate == previous) { return previous; }
+    NSArray<NSArray<NSNumber *> *> *backgrounds = [candidate.attributedString
+        attribute:iTermMalayalamSourceBackgroundsAttribute atIndex:0 effectiveRange:NULL];
+    NSUInteger textEndColumn = [candidate.cellUTF16Boundaries indexOfObject:@(candidate.attributedString.length)];
+    for (NSArray<NSNumber *> *span in backgrounds) {
+        NSUInteger first = span[0].unsignedIntegerValue;
+        NSUInteger end = first + span[1].unsignedIntegerValue;
+        iTermMalayalamCellProjection *left = [candidate projectionAtColumn:first];
+        iTermMalayalamCellProjection *right = [candidate projectionAtColumn:end];
+        // Blank padding has no independent native width. Only its single terminal suffix can own the remainder.
+        if (left.kind != iTermMalayalamCaretKindNativeEdge || right.kind != iTermMalayalamCaretKindNativeEdge ||
+            !left.nativeEdge || !right.nativeEdge ||
+            (first > textEndColumn) || (end > textEndColumn && end != (NSUInteger)_gridSize.width)) {
+            [_malayalamRows removeObjectForKey:@(line)];
+            [self traceMalayalamRow:line layout:nil event:@"fallback-background-without-native-edges"];
+            return nil;
+        }
+    }
+    // Native edges without a source-cell boundary cannot select a logical cell in this slice.
+    for (iTermMalayalamNativeEdge *edge in candidate.nativeEdges) {
+        iTermMalayalamRowHit *hit = [candidate hitTestWithNativeX:edge.x];
+        if (!hit || hit.logicalColumns.count == 0) {
+            [self traceMalayalamRow:line layout:nil event:@"fallback-native-edge-without-logical-cell"];
+            return nil;
+        }
+    }
+    __block BOOL nativeUnderline = YES;
+    [candidate.attributedString enumerateAttribute:iTermMalayalamUnderlineAttribute
+        inRange:NSMakeRange(0, candidate.attributedString.length)
+        options:0 usingBlock:^(NSNumber *underlined, NSRange range, BOOL *stop) {
+            if (underlined.boolValue &&
+                NSIsEmptyRect([self malayalamNativeBoundsForRange:range layout:candidate])) {
+                nativeUnderline = NO;
+                *stop = YES;
+            }
+        }];
+    if (!nativeUnderline) {
+        [_malayalamRows removeObjectForKey:@(line)];
+        [self traceMalayalamRow:line layout:nil event:@"fallback-underline-without-native-edges"];
+        return nil;
+    }
+    if (!_malayalamRows) {
+        _malayalamRows = [NSMutableDictionary dictionary];
+    }
+    if (_malayalamRows.count > 256) {
+        [_malayalamRows removeAllObjects];
+    }
+    _malayalamRows[@(line)] = candidate;
+    return candidate;
+}
+
+- (CGFloat)malayalamPanForLayout:(iTermMalayalamRowLayout *)layout line:(int)line {
+    int column = _cursorCoord.x;
+    if (line != _cursorCoord.y + _numberOfScrollbackLines) {
+        if (_malayalamInspectionCell.y != line + _totalScrollbackOverflow ||
+            _malayalamInspectionCell.x < 0 || _malayalamInspectionCell.x >= _gridSize.width) {
+            return 0;
+        }
+        // Reveal the native cluster containing the exact copied cell, without expanding its source selection.
+        iTermMalayalamRowSelection *source = [layout selectionForColumns:NSMakeRange(_malayalamInspectionCell.x, 1)];
+        if (!source) {
+            return 0;
+        }
+        NSRange range = [layout displayEnclosureForUTF16Range:source.utf16Range];
+        if (range.location == NSNotFound) { return 0; }
+        const NSUInteger end = [layout.cellUTF16Boundaries indexOfObject:@(NSMaxRange(range))];
+        if (end == NSNotFound) {
+            return 0;
+        }
+        column = (int)end;
+    }
+    iTermMalayalamCellProjection *focus = [layout projectionAtColumn:column];
+    if (!focus.nativeEdge) {
+        return 0;
+    }
+    // Stateless minimal pan, with room for the two-point native caret at the right edge.
+    return [iTermMalayalamRowLayout panOffsetWithNaturalWidth:layout.naturalWidth
+        viewportWidth:MAX(1, NSWidth(_scrollViewDocumentVisibleRect) - 2 * [iTermPreferences sideMargins] - 2)
+        caretX:focus.nativeEdge.x previousOffset:0];
+}
+
+// A trailing blank suffix keeps its native cell advances; reveal its caret without adding blank rows.
+- (CGFloat)malayalamOriginXForFragment:(iTermMalayalamDisplayFragment *)fragment {
+    if (fragment.tableCellWidth > 0 || fragment.tableRow) { return fragment.originX; }
+    iTermMalayalamRowLayout *layout = fragment.layout;
+    if (!layout || !fragment.retainsTrailingPadding) { return fragment.originX; }
+    NSInteger column = _cursorCoord.x;
+    if (_malayalamInspectionCell.y == fragment.sourceRow + _totalScrollbackOverflow &&
+        _malayalamInspectionCell.x >= fragment.firstColumn && _malayalamInspectionCell.x < fragment.endColumn) {
+        // The exact-cell strip owns inspection intent, even on the live cursor's source row.
+        iTermMalayalamRowSelection *source = [layout selectionForColumns:
+            NSMakeRange(_malayalamInspectionCell.x - fragment.firstColumn, 1)];
+        if (!source) { return fragment.originX; }
+        NSRange range = [layout displayEnclosureForUTF16Range:source.utf16Range];
+        if (range.location == NSNotFound) { return fragment.originX; }
+        NSUInteger end = [layout.cellUTF16Boundaries indexOfObject:@(NSMaxRange(range))];
+        if (end == NSNotFound) { return fragment.originX; }
+        column = fragment.firstColumn + end;
+    } else if (fragment.sourceRow != _cursorCoord.y + _numberOfScrollbackLines) {
+        return fragment.originX;
+    }
+    if (column < fragment.firstColumn || column > fragment.endColumn) { return fragment.originX; }
+    iTermMalayalamCellProjection *focus = [layout projectionAtColumn:column - fragment.firstColumn];
+    if (!focus.nativeEdge) { return fragment.originX; }
+    CGFloat width = MAX(1, NSWidth(_scrollViewDocumentVisibleRect) - 2 * [iTermPreferences sideMargins] - 2);
+    CGFloat pan = [iTermMalayalamRowLayout panOffsetWithNaturalWidth:layout.naturalWidth + fragment.originX
+        viewportWidth:width caretX:focus.nativeEdge.x + fragment.originX previousOffset:0];
+    return fragment.originX - pan;
+}
+
+- (CGFloat)displayYForColumn:(int)column sourceRow:(int)row {
+    iTermMalayalamDisplayFragment *fragment = [_malayalamDisplayMap fragmentForColumn:column sourceRow:row];
+    NSInteger displayRow = _malayalamDisplayMap && row >= 0 ? [_malayalamDisplayMap firstDisplayRowForSourceRow:row] : row;
+    return (fragment ? fragment.displayRow : displayRow) * _cellSize.height;
+}
+
+- (int)sourceRowForDisplayRow:(int)row {
+    return _malayalamDisplayMap ? (int)[_malayalamDisplayMap sourceRowAtDisplayRow:row] : row;
+}
+
+- (NSValue *)malayalamCellForX:(CGFloat)x displayRow:(int)row {
+    return [self malayalamCellForX:x displayRow:row reportingMouseCell:NO];
+}
+
+- (NSValue *)malayalamCellForX:(CGFloat)x displayRow:(int)row reportingMouseCell:(BOOL)reporting {
+    if (!_malayalamDisplayMap) { return nil; }
+    NSArray<iTermMalayalamDisplayFragment *> *pieces = _malayalamDisplayMap.fragments;
+    iTermMalayalamDisplayFragment *fragment = pieces[MAX(0, MIN(row, (int)pieces.count - 1))];
+    if (fragment.tableRow) {
+        NSInteger sourceRow = fragment.tableRow.sourceRow;
+        NSInteger preferred = _malayalamInspectionCell.y == sourceRow + _totalScrollbackOverflow ? _malayalamInspectionCell.x :
+            (sourceRow == _cursorCoord.y + _numberOfScrollbackLines ? _cursorCoord.x : -1);
+        return [fragment.tableRow hitWithX:x - [iTermPreferences sideMargins] displayRow:row preferredColumn:preferred reportingASCII:reporting];
+    }
+    if (!fragment.layout) { return nil; }
+    iTermMalayalamRowHit *hit = [fragment.layout hitTestWithNativeX:x - [iTermPreferences sideMargins] - [self malayalamOriginXForFragment:fragment] reportingASCII:reporting];
+    NSMutableArray<NSValue *> *cells = [NSMutableArray array];
+    for (NSNumber *column in hit.logicalColumns) {
+        [cells addObjectsFromArray:[fragment sourceCellsForLocalColumn:column.integerValue]];
+    }
+    NSPoint inspection = NSMakePoint(_malayalamInspectionCell.x, _malayalamInspectionCell.y - _totalScrollbackOverflow);
+    NSPoint cursor = NSMakePoint(_cursorCoord.x, _cursorCoord.y + _numberOfScrollbackLines);
+    if (fragment.paragraph) {
+        for (NSValue *cell in cells) { if (NSEqualPoints(cell.pointValue, inspection)) { return cell; } }
+    }
+    for (NSValue *cell in cells) { if (NSEqualPoints(cell.pointValue, cursor)) { return cell; } }
+    return cells.firstObject;
+}
+
+- (NSNumber *)malayalamColumnForX:(CGFloat)x displayRow:(int)row {
+    return [self malayalamColumnForX:x displayRow:row reportingMouseCell:NO];
+}
+
+- (NSNumber *)malayalamColumnForX:(CGFloat)x displayRow:(int)row reportingMouseCell:(BOOL)reporting {
+    if (!_malayalamDisplayMap) { return [self malayalamColumnForX:x line:row reportingMouseCell:reporting]; }
+    NSValue *cell = [self malayalamCellForX:x displayRow:row reportingMouseCell:reporting];
+    return cell ? @(cell.pointValue.x) : nil;
+}
+
+- (NSNumber *)malayalamXForColumn:(int)column line:(int)line {
+    iTermMalayalamTableRow *table = [_malayalamDisplayMap tableRowForSourceRow:line];
+    if (table) {
+        NSNumber *x = [table xForColumn:column];
+        return x ? @(x.doubleValue + [iTermPreferences sideMargins]) : nil;
+    }
+    iTermMalayalamDisplayFragment *fragment = [_malayalamDisplayMap fragmentForColumn:column sourceRow:line];
+    iTermMalayalamRowLayout *layout = fragment ? fragment.layout : [self malayalamLayoutAtLine:line];
+    if (fragment && !layout) {
+        return @([iTermPreferences sideMargins] + column * _cellSize.width);
+    }
+    NSNumber *local = fragment ? [fragment localColumn:column sourceRow:line] : @(column);
+    iTermMalayalamCellProjection *position = local ? [layout projectionAtColumn:local.integerValue] : nil;
+    if (!position.nativeEdge) {
+        return nil;
+    }
+    return @([iTermPreferences sideMargins] + position.nativeEdge.x -
+             (fragment ? -[self malayalamOriginXForFragment:fragment] : [self malayalamPanForLayout:layout line:line]));
+}
+
+- (NSNumber *)malayalamColumnForX:(CGFloat)x line:(int)line {
+    return [self malayalamColumnForX:x line:line reportingMouseCell:NO];
+}
+
+- (NSNumber *)malayalamColumnForX:(CGFloat)x line:(int)line reportingMouseCell:(BOOL)reporting {
+    iTermMalayalamRowLayout *layout = [self malayalamLayoutAtLine:line];
+    if (!layout) {
+        return nil;  // The reserved footer owns its independent logical-column hit targets.
+    }
+    iTermMalayalamRowHit *hit = [layout hitTestWithNativeX:x - [iTermPreferences sideMargins] +
+                               [self malayalamPanForLayout:layout line:line] reportingASCII:reporting];
+    if (hit.logicalColumns.count == 0) {
+        return nil;
+    }
+    // Continuations share an edge. Preserve the actual cursor column if it is a candidate;
+    // otherwise select the first represented column. The strip exposes every exact column.
+    if (line == _cursorCoord.y + _numberOfScrollbackLines &&
+        [hit.logicalColumns containsObject:@(_cursorCoord.x)]) {
+        return @(_cursorCoord.x);
+    }
+    return hit.logicalColumns.firstObject;
+}
+
+- (NSArray<NSValue *> *)malayalamSelectionRects:(NSRange)columns
+                                        layout:(iTermMalayalamRowLayout *)layout
+                                          line:(int)line partial:(BOOL *)partial {
+    iTermMalayalamTableRow *table = [_malayalamDisplayMap tableRowForSourceRow:line];
+    if (table) {
+        iTermMalayalamRowSelection *span = [table.source.layout selectionForColumns:columns];
+        *partial = span.startsInsideCluster || span.endsInsideCluster;
+        NSMutableArray<NSValue *> *rects = [NSMutableArray array];
+        for (NSValue *value in [table rectsWithColumns:columns lineHeight:_cellSize.height expandClusters:YES]) {
+            [rects addObject:[NSValue valueWithRect:NSOffsetRect(value.rectValue, [iTermPreferences sideMargins], 0)]];
+        }
+        return rects;
+    }
+    iTermMalayalamRowSelection *selection = [layout selectionForColumns:columns];
+    if (!selection) { return @[]; }
+    *partial = selection.startsInsideCluster || selection.endsInsideCluster;
+    NSArray<iTermMalayalamDisplayFragment *> *group = [_malayalamDisplayMap fragmentsForSourceRow:line];
+    iTermMalayalamProseParagraph *paragraph = group.firstObject.paragraph;
+    if (paragraph) {
+        NSMutableArray<NSValue *> *rects = [NSMutableArray array];
+        for (NSValue *value in [paragraph selectionRectsWithColumns:columns sourceRow:line lineHeight:_cellSize.height
+            displayStart:group.firstObject.displayRow]) {
+            [rects addObject:[NSValue valueWithRect:NSOffsetRect(value.rectValue, [iTermPreferences sideMargins], 0)]];
+        }
+        return rects;
+    }
+    NSRange source = [layout displayEnclosureForUTF16Range:selection.utf16Range];
+    if (source.location == NSNotFound) { return @[]; }
+    NSMutableArray<NSValue *> *rects = [NSMutableArray array];
+    NSArray<iTermMalayalamDisplayFragment *> *fragments = [_malayalamDisplayMap fragmentsForSourceRow:line];
+    if (fragments.count) {
+        for (iTermMalayalamDisplayFragment *fragment in fragments) {
+            NSRange intersection = NSIntersectionRange(source, fragment.sourceRange);
+            if (!intersection.length) { continue; }
+            iTermMalayalamRowLayout *piece = fragment.layout;
+            NSUInteger start = [piece.cellUTF16Boundaries indexOfObject:@(intersection.location - fragment.sourceRange.location)];
+            NSUInteger end = [piece.cellUTF16Boundaries indexOfObject:@(NSMaxRange(intersection) - fragment.sourceRange.location)];
+            iTermMalayalamCellProjection *left = start == NSNotFound ? nil : [piece projectionAtColumn:start];
+            iTermMalayalamCellProjection *right = end == NSNotFound ? nil : [piece projectionAtColumn:end];
+            if (!left.nativeEdge || !right.nativeEdge) { continue; }
+            CGFloat x = [iTermPreferences sideMargins] + [self malayalamOriginXForFragment:fragment];
+            [rects addObject:[NSValue valueWithRect:NSMakeRect(x + MIN(left.nativeEdge.x, right.nativeEdge.x),
+                fragment.displayRow * _cellSize.height, fabs(right.nativeEdge.x - left.nativeEdge.x), _cellSize.height)]];
+        }
+        return rects;
+    }
+    NSUInteger start = [layout.cellUTF16Boundaries indexOfObject:@(source.location)];
+    NSUInteger end = [layout.cellUTF16Boundaries indexOfObject:@(NSMaxRange(source))];
+    if (start == NSNotFound || end == NSNotFound) { return rects; }
+    NSNumber *left = [self malayalamXForColumn:(int)start line:line];
+    NSNumber *right = [self malayalamXForColumn:(int)end line:line];
+    if (left && right) {
+        [rects addObject:[NSValue valueWithRect:NSMakeRect(MIN(left.doubleValue, right.doubleValue),
+            line * _cellSize.height, fabs(right.doubleValue - left.doubleValue), _cellSize.height)]];
+    }
+    return rects;
+}
+
+// Unlike source selection, a real background boundary must never expand across a cluster.
+- (NSArray<NSValue *> *)malayalamBackgroundRects:(NSRange)columns
+                                         layout:(iTermMalayalamRowLayout *)layout line:(int)line {
+    iTermMalayalamTableRow *table = [_malayalamDisplayMap tableRowForSourceRow:line];
+    if (table) {
+        NSMutableArray<NSValue *> *rects = [NSMutableArray array];
+        for (NSValue *value in [table rectsWithColumns:columns lineHeight:_cellSize.height expandClusters:NO]) {
+            [rects addObject:[NSValue valueWithRect:NSOffsetRect(value.rectValue, [iTermPreferences sideMargins], 0)]];
+        }
+        return rects;
+    }
+    NSUInteger start = layout.cellUTF16Boundaries[columns.location].unsignedIntegerValue;
+    NSUInteger end = layout.cellUTF16Boundaries[NSMaxRange(columns)].unsignedIntegerValue;
+    NSArray<iTermMalayalamDisplayFragment *> *pieces = [_malayalamDisplayMap fragmentsForSourceRow:line];
+    if (!pieces.count) {
+        NSNumber *left = [self malayalamXForColumn:(int)columns.location line:line];
+        NSNumber *right = [self malayalamXForColumn:(int)NSMaxRange(columns) line:line];
+        if (!left || !right) { return @[]; }
+        CGFloat x = columns.location == 0 ? 0 : left.doubleValue;
+        CGFloat limit = NSMaxRange(columns) == layout.cellUTF16Boundaries.count - 1 ?
+            NSWidth(_scrollViewDocumentVisibleRect) : right.doubleValue;
+        return @[[NSValue valueWithRect:NSMakeRect(x, line * _cellSize.height, MAX(0, limit - x), _cellSize.height)]];
+    }
+    NSMutableArray<NSValue *> *rects = [NSMutableArray array];
+    for (iTermMalayalamDisplayFragment *piece in pieces) {
+        NSUInteger first = MAX(start, piece.sourceRange.location);
+        NSUInteger last = MIN(end, NSMaxRange(piece.sourceRange));
+        BOOL terminalPadding = piece == pieces.lastObject && start == layout.attributedString.length;
+        if (first >= last && !terminalPadding) { continue; }
+        NSRange range = NSMakeRange(first - piece.sourceRange.location, last - first);
+        NSUInteger a = [piece.layout.cellUTF16Boundaries indexOfObject:@(range.location)];
+        NSUInteger b = [piece.layout.cellUTF16Boundaries indexOfObject:@(NSMaxRange(range))];
+        iTermMalayalamCellProjection *left = [piece.layout projectionAtColumn:a];
+        iTermMalayalamCellProjection *right = [piece.layout projectionAtColumn:b];
+        if (left.kind != iTermMalayalamCaretKindNativeEdge || right.kind != iTermMalayalamCaretKindNativeEdge ||
+            !left.nativeEdge || !right.nativeEdge) { continue; }
+        CGFloat origin = [iTermPreferences sideMargins] + [self malayalamOriginXForFragment:piece];
+        CGFloat x = start <= piece.sourceRange.location ? 0 : origin + left.nativeEdge.x;
+        BOOL throughEdge = end > NSMaxRange(piece.sourceRange) ||
+            (piece == pieces.lastObject && NSMaxRange(columns) == layout.cellUTF16Boundaries.count - 1);
+        CGFloat limit = throughEdge ? NSWidth(_scrollViewDocumentVisibleRect) : origin + right.nativeEdge.x;
+        [rects addObject:[NSValue valueWithRect:NSMakeRect(x, piece.displayRow * _cellSize.height,
+            MAX(0, limit - x), _cellSize.height)]];
+    }
+    return rects;
+}
+
+- (BOOL)drawMalayalamRow:(int)line atY:(CGFloat)y context:(CGContextRef)context
+          virtualOffset:(CGFloat)virtualOffset {
+    iTermMalayalamRowLayout *layout = [self malayalamLayoutAtLine:line];
+    iTermMalayalamTableRow *table = [_malayalamDisplayMap tableRowForSourceRow:line];
+    if (table) {
+        iTermMalayalamRowLayout *paint = self.malayalamPreparedTableSource.layout ?: table.source.layout;
+        for (NSInteger display = table.displayStart; display < table.displayStart + table.height; display++) {
+            for (iTermMalayalamDisplayFragment *piece in [table fragmentsAtDisplayRow:display]) {
+                iTermMalayalamRowLayout *current = [piece paintLayoutFrom:paint];
+                if (!current) { continue; }
+                CGContextSaveGState(context);
+                NSValue *clip = [table clipRectForColumn:piece.firstColumn displayRow:display lineHeight:_cellSize.height];
+                CGContextClipToRect(context, NSRectToCGRect(NSOffsetRect(clip.rectValue,
+                    [iTermPreferences sideMargins], -virtualOffset)));
+                [self drawMalayalamLayout:current sourceLine:line atY:display * _cellSize.height
+                    originX:piece.originX context:context virtualOffset:virtualOffset];
+                CGContextRestoreGState(context);
+            }
+        }
+        // Borders are structural paths, not stretched text. Every row uses the group's anchors.
+        CGContextSaveGState(context);
+        CGContextSetLineWidth(context, 1);
+        CGContextSetShouldAntialias(context, NO);
+        const CGFloat top = table.displayStart * _cellSize.height - virtualOffset;
+        const CGFloat bottom = top + table.height * _cellSize.height;
+        const CGFloat middle = top + _cellSize.height / 2;
+        for (NSUInteger i = 0; i < table.anchors.count; i++) {
+            NSInteger column = table.source.columns[i].integerValue;
+            NSUInteger offset = paint.cellUTF16Boundaries[column].unsignedIntegerValue;
+            CGColorRef color = (__bridge CGColorRef)[paint.attributedString attribute:(NSString *)kCTForegroundColorAttributeName
+                atIndex:offset effectiveRange:NULL];
+            if (color) { CGContextSetStrokeColorWithColor(context, color); }
+            BOOL bold = [[paint.attributedString attribute:iTermBoldAttribute atIndex:offset effectiveRange:NULL] boolValue];
+            CGContextSetLineWidth(context, bold ? 2 : 1);
+            CGFloat x = floor([iTermPreferences sideMargins] + table.anchors[i].doubleValue + _cellSize.width / 2) + 0.5;
+            unichar joint = [table.source.cells[column] characterAtIndex:0];
+            BOOL downOnly = joint == 0x250c || joint == 0x252c || joint == 0x2510;
+            BOOL upOnly = joint == 0x2514 || joint == 0x2534 || joint == 0x2518;
+            CGContextMoveToPoint(context, x, downOnly ? middle : top);
+            CGContextAddLineToPoint(context, x, upOnly ? middle : bottom);
+            CGContextStrokePath(context);
+        }
+        if (table.source.horizontal) {
+            NSInteger first = table.source.columns.firstObject.integerValue;
+            NSInteger last = table.source.columns.lastObject.integerValue;
+            for (NSInteger column = first; column <= last; column++) {
+                NSUInteger offset = paint.cellUTF16Boundaries[column].unsignedIntegerValue;
+                CGColorRef color = (__bridge CGColorRef)[paint.attributedString attribute:(NSString *)kCTForegroundColorAttributeName
+                    atIndex:offset effectiveRange:NULL];
+                if (color) { CGContextSetStrokeColorWithColor(context, color); }
+                BOOL bold = [[paint.attributedString attribute:iTermBoldAttribute atIndex:offset effectiveRange:NULL] boolValue];
+                CGContextSetLineWidth(context, bold ? 2 : 1);
+                CGFloat left = [table xForColumn:column].doubleValue + (column == first ? _cellSize.width / 2 : 0);
+                CGFloat right = column == last ? [table xForColumn:last].doubleValue + _cellSize.width / 2 :
+                    [table xForColumn:column + 1].doubleValue;
+                CGContextMoveToPoint(context, [iTermPreferences sideMargins] + left, floor(middle) + 0.5);
+                CGContextAddLineToPoint(context, [iTermPreferences sideMargins] + right, floor(middle) + 0.5);
+                CGContextStrokePath(context);
+            }
+        }
+        // Prefix spaces and structural paths have no CTLine paint, but keep their accepted underline style.
+        NSInteger firstBorder = table.source.columns.firstObject.integerValue;
+        NSInteger lastBorder = table.source.columns.lastObject.integerValue;
+        for (NSInteger column = 0; column <= lastBorder; column++) {
+            if (column >= firstBorder && !table.source.horizontal &&
+                ![table.source.columns containsObject:@(column)]) { continue; }
+            NSUInteger offset = paint.cellUTF16Boundaries[column].unsignedIntegerValue;
+            if (offset >= paint.attributedString.length) { continue; }
+            NSDictionary *attributes = [paint.attributedString attributesAtIndex:offset effectiveRange:NULL];
+            if (![attributes[iTermMalayalamUnderlineAttribute] boolValue]) { continue; }
+            for (NSValue *value in [table rectsWithColumns:NSMakeRange(column, 1)
+                                               lineHeight:_cellSize.height expandClusters:NO]) {
+                NSRect span = NSOffsetRect(value.rectValue, [iTermPreferences sideMargins], 0);
+                for (CGFloat rowY = NSMinY(span); rowY < NSMaxY(span); rowY += _cellSize.height) {
+                    [self drawUnderlineOrStrikethroughOfColor:[self underlineColorForAttributes:attributes]
+                        wantUnderline:YES style:NSUnderlineStyleSingle font:attributes[NSFontAttributeName]
+                        rect:NSMakeRect(span.origin.x, rowY, span.size.width, 2 * _cellSize.height)
+                        context:context virtualOffset:virtualOffset];
+                }
+            }
+        }
+        CGContextRestoreGState(context);
+        return YES;
+    }
+    if (!layout) {
+        return NO;
+    }
+    NSArray<iTermMalayalamDisplayFragment *> *fragments = [_malayalamDisplayMap fragmentsForSourceRow:line];
+    iTermMalayalamProseParagraph *paragraph = fragments.firstObject.paragraph;
+    if (paragraph && line != paragraph.firstSourceRow) { return YES; }
+    iTermMalayalamRowLayout *paint = layout;
+    if (paragraph) {
+        NSMutableDictionary<NSNumber *, iTermMalayalamRowLayout *> *paintRows = [NSMutableDictionary dictionary];
+        for (NSInteger row = paragraph.firstSourceRow; row <= paragraph.lastSourceRow; row++) {
+            iTermMalayalamRowLayout *current = [self malayalamLayoutAtLine:(int)row];
+            if (current) { paintRows[@(row)] = current; }
+        }
+        paint = [paragraph paintLayoutWithRows:paintRows];
+    }
+    if (fragments.count) {
+        if (!paint) { return YES; }
+        for (iTermMalayalamDisplayFragment *fragment in fragments) {
+            iTermMalayalamRowLayout *piece = [fragment paintLayoutFrom:paint];
+            if (piece) {
+                [self drawMalayalamLayout:piece sourceLine:line atY:fragment.displayRow * _cellSize.height
+                                 originX:[self malayalamOriginXForFragment:fragment] context:context virtualOffset:virtualOffset];
+            }
+        }
+        return YES;
+    }
+    [self drawMalayalamLayout:layout sourceLine:line atY:y
+                     originX:-[self malayalamPanForLayout:layout line:line]
+                     context:context virtualOffset:virtualOffset];
+    return YES;
+}
+
+- (NSRect)malayalamNativeBoundsForRange:(NSRange)range layout:(iTermMalayalamRowLayout *)layout {
+    NSUInteger first = [layout.cellUTF16Boundaries indexOfObject:@(range.location)];
+    NSUInteger end = [layout.cellUTF16Boundaries indexOfObject:@(NSMaxRange(range))];
+    if (first == NSNotFound || end == NSNotFound) { return NSZeroRect; }
+    iTermMalayalamCellProjection *left = [layout projectionAtColumn:first];
+    iTermMalayalamCellProjection *right = [layout projectionAtColumn:end];
+    if (left.kind != iTermMalayalamCaretKindNativeEdge || right.kind != iTermMalayalamCaretKindNativeEdge ||
+        !left.nativeEdge || !right.nativeEdge) { return NSZeroRect; }
+    return NSMakeRect(MIN(left.nativeEdge.x, right.nativeEdge.x), 0,
+                      fabs(right.nativeEdge.x - left.nativeEdge.x), _cellSize.height);
+}
+
+- (void)drawMalayalamUnderlines:(iTermMalayalamRowLayout *)layout atY:(CGFloat)y
+                      originX:(CGFloat)originX virtualOffset:(CGFloat)virtualOffset {
+    for (id object in (__bridge NSArray *)CTLineGetGlyphRuns(layout.line)) {
+        CTRunRef run = (__bridge CTRunRef)object;
+        NSDictionary *attributes = (__bridge NSDictionary *)CTRunGetAttributes(run);
+        if (![attributes[iTermMalayalamUnderlineAttribute] boolValue] || CTRunGetGlyphCount(run) == 0) { continue; }
+        CGPoint position;
+        CTRunGetPositions(run, CFRangeMake(0, 1), &position);
+        const CGFloat width = CTRunGetTypographicBounds(run, CFRangeMake(0, 0), NULL, NULL, NULL);
+        if (width <= 0) { continue; }  // Combining glyphs follow their native base-glyph owner.
+        NSRect rect = NSMakeRect([iTermPreferences sideMargins] + originX + position.x,
+                                 y, width, _cellSize.height * 2);
+        iTermUnderlineContext storage = { .maskGraphicsContext = nil, .alphaMask = nil };
+        [self drawUnderlinedOrStruckthroughTextWithContext:&storage wantUnderline:YES inRect:rect
+            underlineColor:[self underlineColorForAttributes:attributes] style:NSUnderlineStyleSingle
+            font:attributes[NSFontAttributeName] virtualOffset:virtualOffset block:^(CGContextRef ctx) {
+                CGColorRef black = NSColor.blackColor.CGColor;
+                NSAttributedString *maskText = [self attributedString:layout.attributedString bySettingForegroundColorTo:black];
+                CTLineRef maskLine = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)maskText);
+                CGContextSaveGState(ctx);
+                CGContextSetShouldAntialias(ctx, NO);
+                CGContextTranslateCTM(ctx, -position.x - 1, self->_baselineOffset + self->_cellSize.height);
+                CGContextScaleCTM(ctx, 1, -1);
+                CGContextSetTextMatrix(ctx, CGAffineTransformIdentity);
+                // The upstream descender mask smears one point around the same glyph geometry.
+                for (int i = 0; i <= 4; i++) {
+                    for (int dy = -1; dy <= 1; dy++) {
+                        CGContextSetTextPosition(ctx, 0, dy);
+                        CTLineDraw(maskLine, ctx);
+                    }
+                    CGContextTranslateCTM(ctx, 0.5, 0);
+                }
+                CGContextRestoreGState(ctx);
+                CFRelease(maskLine);
+            }];
+        if (storage.maskGraphicsContext) { CGContextRelease(storage.maskGraphicsContext); }
+        if (storage.alphaMask) { CGImageRelease(storage.alphaMask); }
+    }
+}
+
+- (void)drawMalayalamLayout:(iTermMalayalamRowLayout *)layout sourceLine:(int)line
+                       atY:(CGFloat)y originX:(CGFloat)originX context:(CGContextRef)context
+             virtualOffset:(CGFloat)virtualOffset {
+    CGContextSaveGState(context);
+    // One shaped mixed row uses its non-ASCII font policy, not a previous row's raster state.
+    const BOOL antialias = (_isRetina && _forceAntialiasingOnRetina) ||
+        (_useNonAsciiFont ? _nonAsciiAntiAlias : _asciiAntiAlias);
+    CGContextSetShouldAntialias(context, antialias);
+    CGContextSetBlendMode(context, kCGBlendModeNormal);
+    // Core Text requires an upright text matrix, so put AppKit's vertical flip in the CTM.
+    CGContextTranslateCTM(context, [iTermPreferences sideMargins] + originX,
+                          y + _baselineOffset + _cellSize.height - virtualOffset);
+    CGContextScaleCTM(context, 1, -1);
+    CGContextSetTextMatrix(context, CGAffineTransformIdentity);
+    CGContextSetTextPosition(context, 0, 0);
+    CGContextSaveGState(context);
+    CTLineDraw(layout.line, context);
+    CGContextRestoreGState(context);
+    BOOL syntheticBoldDrawn = NO;
+    for (id object in (__bridge NSArray *)CTLineGetGlyphRuns(layout.line)) {
+        CTRunRef run = (__bridge CTRunRef)object;
+        CFRange range = CTRunGetStringRange(run);
+        if (!_boldAllowed || range.location < 0 || (NSUInteger)range.location >= layout.attributedString.length) {
+            continue;
+        }
+        NSDictionary *source = [layout.attributedString attributesAtIndex:range.location effectiveRange:NULL];
+        NSDictionary *resolved = (__bridge NSDictionary *)CTRunGetAttributes(run);
+        CTFontRef font = (__bridge CTFontRef)resolved[(NSString *)kCTFontAttributeName];
+        if (![source[iTermBoldAttribute] boolValue] || !font ||
+            (![source[iTermFakeBoldAttribute] boolValue] && (CTFontGetSymbolicTraits(font) & kCTFontTraitBold))) {
+            continue;
+        }
+        // Reuse upstream's synthetic-bold strike, including after Core Text font fallback.
+        CGContextSaveGState(context);
+        CGContextSetTextMatrix(context, CGAffineTransformIdentity);
+        CGContextSetTextPosition(context, antialias ? _antiAliasedShift : 1, 0);
+        CTRunDraw(run, context, CFRangeMake(0, 0));
+        syntheticBoldDrawn = YES;
+        CGContextRestoreGState(context);
+    }
+    [self traceMalayalamRow:line layout:layout
+                     event:syntheticBoldDrawn ? @"CTLineDraw-natural+synthetic-bold" : @"CTLineDraw-natural"];
+    CGContextRestoreGState(context);
+    [self drawMalayalamUnderlines:layout atY:y originX:originX virtualOffset:virtualOffset];
+}
+
 - (void)didFinishSetup {
+    [self invalidateNaturalRowCachesForModeChange];
+    if (!_malayalamGenerationTrackingEnabled && [iTermAdvancedSettingsModel naturalRows]) {
+        // As in Metal, tracking is sticky and must be active before source identities can key reuse.
+        VT100LineInfoEnableGenerationTracking();
+        _malayalamGenerationTrackingEnabled = YES;
+    }
     [_attributedStringBuilder setColorMap:_colorMap
                              reverseVideo:_reverseVideo
                           minimumContrast:_minimumContrast
@@ -275,6 +1069,36 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
                              fontProvider:_fontProvider
                                 fontTable:_fontTable
                                  delegate:self];
+    if (!_malayalamConfigTracker) { _malayalamConfigTracker = [[iTermConfigGenerationTracker alloc] init]; }
+    iTermRowRenderInputs inputs;
+    memset(&inputs, 0, sizeof(inputs));
+    inputs.colorMapGeneration = _colorMap.generation;
+    inputs.reverseVideo = _reverseVideo;
+    inputs.useCustomBoldColor = _useCustomBoldColor;
+    inputs.brightenBold = _brightenBold;
+    inputs.useSelectedTextColor = _useSelectedTextColor;
+    inputs.transparencyAlpha = _transparencyAlpha;
+    inputs.transparencyAffectsOnlyDefaultBackgroundColor = _transparencyAffectsOnlyDefaultBackgroundColor;
+    inputs.useNonAsciiFont = _useNonAsciiFont;
+    inputs.boldAllowed = _boldAllowed;
+    inputs.italicAllowed = _italicAllowed;
+    // Remaining builder switches are conservative; blink phase/raster policy do not affect eligible natural rows.
+    inputs.asciiLigatures = _attributedStringBuilder.asciiLigatures;
+    inputs.asciiLigaturesAvailable = _attributedStringBuilder.asciiLigaturesAvailable;
+    inputs.nonAsciiLigatures = _attributedStringBuilder.nonAsciiLigatures;
+    inputs.zippy = _attributedStringBuilder.zippy;
+    inputs.preferSpeedToFullLigatureSupport = _attributedStringBuilder.preferSpeedToFullLigatureSupport;
+    inputs.lowFiCombiningMarks = _attributedStringBuilder.lowFiCombiningMarks;
+    uint64_t generation = [_malayalamConfigTracker generationForRenderInputs:&inputs
+        colorMap:(id)_colorMap colorSpace:[NSColorSpace it_defaultColorSpace] fontTable:_fontTable];
+    if (generation != _malayalamConfigGeneration || _minimumContrast != _malayalamCacheMinimumContrast ||
+        !NSEqualSizes(_cellSize, _malayalamCacheCellSize)) {
+        _malayalamSourceRows = nil;
+        _malayalamNextSourceRows = nil;
+        _malayalamConfigGeneration = generation;
+        _malayalamCacheMinimumContrast = _minimumContrast;
+        _malayalamCacheCellSize = _cellSize;
+    }
 }
 
 - (void)drawTextViewContentInRect:(NSRect)rect
@@ -385,6 +1209,7 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
 
 - (NSInteger)numberOfEquivalentBackgroundColorLinesInRunArrays:(NSArray<iTermBackgroundColorRunsInLine *> *)backgroundRunArrays
                                                      fromIndex:(NSInteger)startIndex {
+    if (_malayalamDisplayMap) { return 1; }
     NSInteger count = 1;
     iTermBackgroundColorRunsInLine *reference = backgroundRunArrays[startIndex];
     for (NSInteger i = startIndex + 1; i < backgroundRunArrays.count; i++) {
@@ -431,7 +1256,7 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
         // First, find all the background runs. The outer array (backgroundRunArrays) will have one
         // element per line. That element (a PTYTextViewBackgroundRunArray) contains the line number,
         // y origin, and an array of PTYTextViewBackgroundRunBox objects.
-        const double y = line * _cellSize.height;
+        const double y = [self displayYForColumn:0 sourceRow:line];
         // An array of PTYTextViewBackgroundRunArray objects (one element per line).
 
 //        NSLog(@"Draw line %d at %f", line, y);
@@ -531,7 +1356,8 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
     }
     CGContextRef ctx = [[NSGraphicsContext currentContext] CGContext];
 
-    const BOOL drawCursorBeforeText = (_cursorType == CURSOR_UNDERLINE || _cursorType == CURSOR_VERTICAL);
+    const BOOL drawCursorBeforeText = ![iTermAdvancedSettingsModel naturalRows] &&
+        (_cursorType == CURSOR_UNDERLINE || _cursorType == CURSOR_VERTICAL);
     iTermCursor *cursor = nil;
     if (drawCursorBeforeText) {
         cursor = [self drawCursor:NO
@@ -645,6 +1471,10 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
     for (NSInteger i = 0; i < backgroundRunArrays.count; ) {
         iTermBackgroundColorRunsInLine *runArray = backgroundRunArrays[i];
         NSInteger rows = runArray.numberOfEquivalentRows;
+        if ([iTermAdvancedSettingsModel naturalRows]) {
+            rows = 1;
+            runArray.numberOfEquivalentRows = 1;
+        }
         if (rows == 0) {
             rows = [self numberOfEquivalentBackgroundColorLinesInRunArrays:backgroundRunArrays fromIndex:i];
             runArray.numberOfEquivalentRows = rows;
@@ -712,6 +1542,93 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
                           pad:(BOOL)pad
                       padding:(NSSize)padding
                   drawingMode:(iTermBackgroundDrawingMode)bgMode {
+    iTermMalayalamRowLayout *layout = [_malayalamDisplayMap tableRowForSourceRow:line].source.layout ?:
+        [self malayalamLayoutAtLine:line];
+    if (layout) {
+        const BOOL enableBlending = [self blendManually];
+        NSColor *background = [self defaultBackgroundColor];
+        NSArray<NSArray<NSNumber *> *> *backgrounds = [layout.attributedString
+            attribute:iTermMalayalamSourceBackgroundsAttribute atIndex:0 effectiveRange:NULL];
+        const iTermBackgroundColorRun *firstRun = runs.firstObject.valuePointer;
+        if (backgrounds.count == 1 && firstRun &&
+            (firstRun->bgColorMode == ColorModeNormal || firstRun->bgColorMode == ColorMode24bit)) {
+            // Preserve the uniform-row fill, including its existing blending and drawing-mode behavior.
+            iTermBackgroundColorRun base = *firstRun;
+            base.selected = NO;
+            base.isMatch = NO;
+            background = [_colorMap processedBackgroundColorForBackgroundColor:
+                [self unprocessedColorForBackgroundRun:&base enableBlending:enableBlending]];
+        }
+        [background set];
+        NSArray<iTermMalayalamDisplayFragment *> *group = [_malayalamDisplayMap fragmentsForSourceRow:line];
+        iTermMalayalamProseParagraph *paragraph = group.firstObject.paragraph;
+        NSInteger displayRows = _malayalamDisplayMap ? [_malayalamDisplayMap fragmentsForSourceRow:line].count : 1;
+        if (!paragraph || line == paragraph.firstSourceRow) {
+            CGFloat baseY = paragraph || group.firstObject.tableRow ? group.firstObject.displayRow * _cellSize.height : yOrigin;
+            iTermRectFill(NSMakeRect(0, baseY, NSWidth(_scrollViewDocumentVisibleRect), displayRows * _cellSize.height), virtualOffset);
+        }
+        for (NSArray<NSNumber *> *span in (backgrounds.count > 1 ? backgrounds : @[])) {
+            iTermBackgroundColorRun base = { 0 };
+            base.modelRange = NSMakeRange(span[0].unsignedIntegerValue, span[1].unsignedIntegerValue);
+            base.bgColorMode = span[2].intValue;
+            base.bgColor = span[3].intValue;
+            base.bgGreen = span[4].intValue;
+            base.bgBlue = span[5].intValue;
+            NSColor *color = [_colorMap processedBackgroundColorForBackgroundColor:
+                [self unprocessedColorForBackgroundRun:&base enableBlending:enableBlending]];
+            if (pad && color.alphaComponent == 0) { continue; }
+            if ((bgMode == iTermBackgroundDrawingModeOmitTransparent && color.alphaComponent == 0) ||
+                (bgMode == iTermBackgroundDrawingModeOnlyTransparent && color.alphaComponent > 0)) { continue; }
+            for (NSValue *value in [self malayalamBackgroundRects:base.modelRange layout:layout line:line]) {
+                NSRect rect = value.rectValue;
+                if (pad) { rect = NSInsetRect(rect, -padding.width, -padding.height); }
+                [self drawBackgroundColor:color inRect:rect enableBlending:enableBlending virtualOffset:virtualOffset];
+            }
+        }
+        for (iTermBoxedBackgroundColorRun *box in runs) {
+            iTermBackgroundColorRun run = *box.valuePointer;
+            if (!run.isMatch && (run.bgColorMode != ColorModeAlternate || run.bgColor != ALTSEM_REVERSED_DEFAULT)) {
+                continue;
+            }
+            // A client-painted cursor follows native cluster edges, never invented interior widths.
+            BOOL partial = NO;
+            NSArray<NSValue *> *rects = [self malayalamSelectionRects:run.modelRange layout:layout line:line partial:&partial];
+            // Exact source selection is painted separately, including its partial-cluster outline.
+            run.selected = NO;
+            NSColor *color = [self unprocessedColorForBackgroundRun:&run enableBlending:enableBlending];
+            box.unprocessedBackgroundColor = color;
+            color = [_colorMap processedBackgroundColorForBackgroundColor:color];
+            box.backgroundColor = color;
+            if (pad && color.alphaComponent == 0) { continue; }
+            if ((bgMode == iTermBackgroundDrawingModeOmitTransparent && color.alphaComponent == 0) ||
+                (bgMode == iTermBackgroundDrawingModeOnlyTransparent && color.alphaComponent > 0)) {
+                continue;
+            }
+            for (NSValue *value in rects) {
+                NSRect rect = value.rectValue;
+                if (pad) { rect = NSInsetRect(rect, -padding.width, -padding.height); }
+                [self drawBackgroundColor:color inRect:rect enableBlending:enableBlending virtualOffset:virtualOffset];
+            }
+        }
+        NSIndexSet *selected = [_selection selectedIndexesOnAbsoluteLine:line + _totalScrollbackOverflow];
+        [selected enumerateRangesUsingBlock:^(NSRange range, BOOL *stop) {
+            BOOL partial = NO;
+            NSArray<NSValue *> *rects = [self malayalamSelectionRects:range layout:layout line:line partial:&partial];
+            for (NSValue *value in rects) {
+                NSRect rect = value.rectValue;
+                if (partial) {
+                    // An outline denotes partial source ownership, not expanded source selection.
+                    [[NSColor systemOrangeColor] set];
+                    rect.origin.y -= virtualOffset;
+                    NSFrameRectWithWidth(rect, 1);
+                } else {
+                    [[self selectionColorForCurrentFocus] set];
+                    iTermRectFill(rect, virtualOffset);
+                }
+            }
+        }];
+        return;
+    }
     const BOOL enableBlending = [self blendManually];
     for (iTermBoxedBackgroundColorRun *box in runs) {
         iTermBackgroundColorRun *run = box.valuePointer;
@@ -1957,6 +2874,10 @@ NSArray<iTermBoxedBackgroundColorRun *> *iTermCombineBackgroundRunsForUnprocesse
                             context:(CGContextRef)ctx
                       virtualOffset:(CGFloat)virtualOffset {
     if (![self canDrawLine:displayLineNumber]) {
+        return;
+    }
+    if (sourceLineNumber == displayLineNumber &&
+        [self drawMalayalamRow:sourceLineNumber atY:y context:ctx virtualOffset:virtualOffset]) {
         return;
     }
     [self drawCharactersForDisplayLine:displayLineNumber
@@ -3877,16 +4798,21 @@ iTermKittyImageDraw *iTermFindKittyImageDrawForVirtualPlaceholder(NSArray<iTermK
 
 - (NSRect)dumbFrameForCursorAt:(VT100GridCoord)cursorCoord {
     const int rowNumber = cursorCoord.y + _numberOfLines - _gridSize.height;
+    if ([_malayalamDisplayMap tableRowForSourceRow:rowNumber] || [self malayalamLayoutAtLine:rowNumber]) {
+        NSNumber *x = [self malayalamXForColumn:cursorCoord.x line:rowNumber];
+        return x ? NSMakeRect(x.doubleValue, [self displayYForColumn:cursorCoord.x sourceRow:rowNumber], 2, _cellSize.height) : NSZeroRect;
+    }
+    const CGFloat y = [self displayYForColumn:cursorCoord.x sourceRow:rowNumber];
     if ([iTermAdvancedSettingsModel fullHeightCursor]) {
         const CGFloat height = MAX(_cellSize.height, _cellSizeWithoutSpacing.height);
         return NSMakeRect(floor(cursorCoord.x * _cellSize.width + [iTermPreferences sideMargins]),
-                          rowNumber * _cellSize.height,
+                          y,
                           MIN(_cellSize.width, _cellSizeWithoutSpacing.width),
                           height);
     } else {
         const CGFloat height = MIN(_cellSize.height, _cellSizeWithoutSpacing.height);
         return NSMakeRect(floor(cursorCoord.x * _cellSize.width + [iTermPreferences sideMargins]),
-                          rowNumber * _cellSize.height + MAX(0, round((_cellSize.height - _cellSizeWithoutSpacing.height) / 2.0)),
+                          y + MAX(0, round((_cellSize.height - _cellSizeWithoutSpacing.height) / 2.0)),
                           MIN(_cellSize.width, _cellSizeWithoutSpacing.width),
                           height);
     }
@@ -3990,6 +4916,18 @@ typedef struct {
       cursorBackgroundColor:(NSColor *)cursorBackgroundColor
               virtualOffset:(CGFloat)virtualOffset {
     DLog(@"drawCursor:%@", @(outline));
+    const int naturalRow = _cursorCoord.y + _numberOfScrollbackLines;
+    if ([_malayalamDisplayMap tableRowForSourceRow:naturalRow] || [self malayalamLayoutAtLine:naturalRow]) {
+        if (!outline && [self shouldDrawCursor]) {
+            NSNumber *x = [self malayalamXForColumn:_cursorCoord.x line:naturalRow];
+            if (x) {
+                [[self cursorColorWithOutline:NO] set];
+                iTermRectFill(NSMakeRect(x.doubleValue, [self displayYForColumn:_cursorCoord.x sourceRow:naturalRow],
+                                        2, _cellSize.height), virtualOffset);
+            }
+        }
+        return nil;
+    }
 
     // Update the last time the cursor moved. A move makes
     // cursorBlinkConditionActive return NO for the next half second, which
@@ -4393,6 +5331,22 @@ typedef struct {
 #pragma mark - Coord/Rect Utilities
 
 - (NSRange)rangeOfVisibleRows {
+    if (_offscreenRenderedRows) {
+        NSRange requested = _offscreenRenderedRows.rangeValue;
+        if (_malayalamDisplayMap && requested.length) {
+            iTermMalayalamProseParagraph *first = [_malayalamDisplayMap fragmentsForSourceRow:requested.location].firstObject.paragraph;
+            iTermMalayalamProseParagraph *last = [_malayalamDisplayMap fragmentsForSourceRow:NSMaxRange(requested) - 1].lastObject.paragraph;
+            NSInteger start = first ? first.firstSourceRow : requested.location;
+            NSInteger end = last ? last.lastSourceRow + 1 : NSMaxRange(requested);
+            return NSMakeRange(start, end - start);
+        }
+        return requested;
+    }
+    if (_malayalamDisplayMap) {
+        int first = [self sourceRowForDisplayRow:floor(NSMinY(_scrollViewDocumentVisibleRect) / _cellSize.height)];
+        int last = (int)[_malayalamDisplayMap lastSourceRowAtDisplayRow:floor((NSMaxY(_scrollViewDocumentVisibleRect) - 0.001) / _cellSize.height)];
+        return NSMakeRange(first, last - first + 1);
+    }
     int visibleRows = floor((_scrollViewContentSize.height - [iTermPreferences topBottomMargins] * 2) / _cellSize.height);
     CGFloat top = _scrollViewDocumentVisibleRect.origin.y;
     int firstVisibleRow = floor(top / _cellSize.height);
@@ -4412,6 +5366,7 @@ typedef struct {
 // Takes bidi into account
 - (VT100GridCoordRange)visualCoordRangeForRect:(NSRect)rect {
     const VT100GridCoordRange naive = [self coordRangeForRect:rect];
+    if (_malayalamDisplayMap) { return naive; }
     if (naive.start.x == 0 && naive.end.x >= self.gridSize.width - 1) {
         // The rect is the full width so no need to mess around with bidi stuff.
         return naive;
@@ -4446,6 +5401,10 @@ typedef struct {
 }
 
 - (VT100GridCoordRange)coordRangeForRect:(NSRect)rect {
+    if (_malayalamDisplayMap) {
+        return VT100GridCoordRangeMake(0, [self sourceRowForDisplayRow:floor(NSMinY(rect) / _cellSize.height)],
+            _gridSize.width, (int)[_malayalamDisplayMap lastSourceRowAtDisplayRow:floor((NSMaxY(rect) - 0.001) / _cellSize.height)] + 1);
+    }
     return VT100GridCoordRangeMake(MAX(0, floor((rect.origin.x - [iTermPreferences sideMargins]) / _cellSize.width)),
                                    floor(rect.origin.y / _cellSize.height),
                                    MAX(0, ceil((NSMaxX(rect) - [iTermPreferences sideMargins]) / _cellSize.width)),
@@ -4454,9 +5413,10 @@ typedef struct {
 
 - (NSRect)rectForCoordRange:(VT100GridCoordRange)coordRange {
     return NSMakeRect(coordRange.start.x * _cellSize.width + [iTermPreferences sideMargins],
-                      coordRange.start.y * _cellSize.height,
+                      [self displayYForColumn:coordRange.start.x sourceRow:coordRange.start.y],
                       (coordRange.end.x - coordRange.start.x) * _cellSize.width,
-                      (coordRange.end.y - coordRange.start.y) * _cellSize.height);
+                      [self displayYForColumn:0 sourceRow:coordRange.end.y] -
+                      [self displayYForColumn:coordRange.start.x sourceRow:coordRange.start.y]);
 }
 
 - (NSRect)rectByGrowingRect:(NSRect)innerRect {
@@ -4583,6 +5543,7 @@ typedef struct {
 }
 
 - (void)updateCachedMetrics {
+    _offscreenRenderedRows = nil;
     _frame = _delegate.frame;
     _visibleRectExcludingTopMargin = [_delegate textDrawingHelperVisibleRectExcludingTopMargin];
     _visibleRectIncludingTopMargin = [_delegate textDrawingHelperVisibleRectIncludingTopMargin];
@@ -4594,7 +5555,10 @@ typedef struct {
 }
 
 - (void)configureForOffscreenRenderingWithFrame:(NSRect)frame
-                                    visibleRect:(NSRect)visibleRect {
+                                    visibleRect:(NSRect)visibleRect
+                                   renderedRows:(NSRange)renderedRows {
+    // Bitmap margins are clip geometry, not extra or missing terminal rows.
+    _offscreenRenderedRows = [NSValue valueWithRange:renderedRows];
     _frame = frame;
     _visibleRectExcludingTopMargin = visibleRect;
     _visibleRectIncludingTopMargin = visibleRect;
@@ -4712,7 +5676,7 @@ typedef struct {
                       sourceLineNumer:row
                     displayLineNumber:row
                               inRange:NSMakeRange(0, _gridSize.width)
-                      startingAtPoint:NSMakePoint([iTermPreferences sideMargins], row * _cellSize.height)
+                      startingAtPoint:NSMakePoint([iTermPreferences sideMargins], [self displayYForColumn:coord.x sourceRow:row])
                            bgselected:NO
                       selectedIndexes:nil
                               bgColor:backgroundColor

@@ -25,6 +25,7 @@
 
 @protocol iTermCancelable;
 @class iTermContentNavigationShortcut;
+@class iTermMalayalamDisplayMap;
 @class iTermIdempotentOperationJoiner;
 @class iTermShellIntegrationWindowController;
 @class iTermURLActionHelper;
@@ -115,6 +116,14 @@ NSPopoverDelegate> {
 // Converts a visual grid coordinate to the logical one the selection model
 // uses. A no-op unless the line is bidi-reordered.
 - (VT100GridCoord)logicalCoordForVisualCoord:(VT100GridCoord)visualCoord;
+
+- (void)updateMalayalamDisplayMap;
+- (iTermMalayalamDisplayMap *)malayalamDisplayMapForHelper:(iTermTextDrawingHelper *)helper;
+- (NSInteger)malayalamDisplayRowCount;
+- (CGFloat)malayalamFollowOrigin;
+- (NSPoint)malayalamViewPointForDisplayPoint:(NSPoint)point;
+- (int)sourceRowForMalayalamDisplayRow:(int)row;
+- (BOOL)hasMalayalamDisplayMap;
 
 @end
 

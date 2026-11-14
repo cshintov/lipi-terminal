@@ -18,6 +18,8 @@
 @class iTermColorMap;
 @protocol iTermExternalAttributeIndexReading;
 @class iTermFontTable;
+@class iTermMalayalamRowLayout;
+@class ScreenCharArray;
 
 @protocol iTermAttributedStringBuilderDelegate<NSObject>
 @property (nonatomic, readonly) BOOL useSelectedTextColor;
@@ -65,6 +67,8 @@ extern NSString *const iTermImageLineAttribute;
 extern NSString *const iTermImageDisplayColumnAttribute;
 extern NSString *const iTermIsBoxDrawingAttribute;
 extern NSString *const iTermUnderlineLengthAttribute;
+extern NSString *const iTermMalayalamUnderlineAttribute;
+extern NSString *const iTermMalayalamSourceBackgroundsAttribute;
 extern NSString *const iTermHasUnderlineColorAttribute;
 extern NSString *const iTermUnderlineColorAttribute;
 extern NSString *const iTermKittyImageRowAttribute;
@@ -73,6 +77,25 @@ extern NSString *const iTermKittyImageIDAttribute;
 extern NSString *const iTermKittyImagePlacementIDAttribute;
 
 @interface iTermAttributedStringBuilder: NSObject
+
+@property(nonatomic, readonly) NSUInteger malayalamRowLayoutBuildCount;
+@property(nonatomic, readonly) NSUInteger malayalamRowLayoutPreparationCount;
+
+// Experimental plain/bold/italic text rows. The caller displays explicit fallback status on nil.
+- (iTermMalayalamRowLayout *)malayalamLayoutForRow:(ScreenCharArray *)row
+                                   expectedWidth:(int)expectedWidth
+                                  backgroundRuns:(NSArray<iTermBoxedBackgroundColorRun *> *)backgroundRuns
+                                     findMatches:(NSData *)findMatches
+                                  previousLayout:(iTermMalayalamRowLayout *)previousLayout
+                                          reason:(NSString **)reason;
+// Candidate-only preparation; ASCII rows remain on the grid unless a Malayalam table group owns them.
+- (iTermMalayalamRowLayout *)malayalamLayoutForRow:(ScreenCharArray *)row
+                                   expectedWidth:(int)expectedWidth
+                                  backgroundRuns:(NSArray<iTermBoxedBackgroundColorRun *> *)backgroundRuns
+                                     findMatches:(NSData *)findMatches
+                                  previousLayout:(iTermMalayalamRowLayout *)previousLayout
+                                          reason:(NSString **)reason
+                                  allowASCIITable:(BOOL)allowASCIITable;
 
 @property (nonatomic, strong, readonly) iTermColorMap *colorMap;
 @property (nonatomic, readonly) BOOL reverseVideo;

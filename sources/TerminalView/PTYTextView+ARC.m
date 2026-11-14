@@ -311,6 +311,42 @@ iTermCommandInfoViewControllerDelegate>
 
 - (VT100GridCoord)coordForPoint:(NSPoint)locationInTextView
        allowRightMarginOverflow:(BOOL)allowRightMarginOverflow {
+    return [self coordForPoint:locationInTextView allowRightMarginOverflow:allowRightMarginOverflow
+           reportingMouseCell:NO];
+}
+
+- (VT100GridCoord)coordForPoint:(NSPoint)locationInTextView
+       allowRightMarginOverflow:(BOOL)allowRightMarginOverflow
+             reportingMouseCell:(BOOL)reporting {
+    VT100GridCoord coord = [self gridCoordForPoint:locationInTextView
+                         allowRightMarginOverflow:allowRightMarginOverflow];
+    if (reporting) {
+        const int limit = [self.dataSource width] - (allowRightMarginOverflow ? 0 : 1);
+        coord.x = MAX(0, MIN((int)floor((locationInTextView.x - [iTermPreferences sideMargins]) / self.charWidth), limit));
+    }
+    if ([iTermAdvancedSettingsModel naturalRows]) {
+        NSRect adjusted = [self adjustedDocumentVisibleRect];
+        NSRect viewport = self.enclosingScrollView.documentVisibleRect;
+        if (self.drawingHelper.malayalamDisplayMap) {
+            NSClipView *clip = self.enclosingScrollView.contentView;
+            viewport = [self convertRect:clip.bounds fromView:clip];
+        }
+        CGFloat correctedY = NSMinY(adjusted) + locationInTextView.y - NSMinY(viewport);
+        NSValue *cell = [self.drawingHelper malayalamCellForX:locationInTextView.x
+                                                displayRow:floor(correctedY / self.lineHeight) reportingMouseCell:reporting];
+        NSNumber *column = cell ? @(cell.pointValue.x) :
+            [self.drawingHelper malayalamColumnForX:locationInTextView.x displayRow:floor(correctedY / self.lineHeight) reportingMouseCell:reporting];
+        if (cell) { coord.y = cell.pointValue.y; }
+        if (column) {
+            const int limit = [self.dataSource width] - (allowRightMarginOverflow ? 0 : 1);
+            coord.x = MAX(0, MIN(column.intValue, limit));
+        }
+    }
+    return coord;
+}
+
+- (VT100GridCoord)gridCoordForPoint:(NSPoint)locationInTextView
+           allowRightMarginOverflow:(BOOL)allowRightMarginOverflow {
     int x, y;
     int width = [self.dataSource width];
 
@@ -324,11 +360,15 @@ iTermCommandInfoViewControllerDelegate>
     // documentVisibleRect and then convert it to be in the space of the adjustedDocumentVisibleRect
     // (which corresponds to what the thinks they clicked on).
     const NSRect adjustedVisibleRect = [self adjustedDocumentVisibleRect];
-    const NSRect scrollviewVisibleRect = [self.enclosingScrollView documentVisibleRect];
+    NSRect scrollviewVisibleRect = [self.enclosingScrollView documentVisibleRect];
+    if ([self hasMalayalamDisplayMap]) {
+        NSClipView *clip = self.enclosingScrollView.contentView;
+        scrollviewVisibleRect = [self convertRect:clip.bounds fromView:clip];
+    }
     const CGFloat relativeY = locationInTextView.y - NSMinY(scrollviewVisibleRect);
     const CGFloat correctedY = NSMinY(adjustedVisibleRect) + relativeY;
 
-    y = correctedY / self.lineHeight;
+    y = [self sourceRowForMalayalamDisplayRow:floor(correctedY / self.lineHeight)];
 
     // If the scrollview's viewport height disagrees with rows*lineHeight (as can
     // happen after instant replay leaves the grid out of sync with the view; see
@@ -381,8 +421,18 @@ iTermCommandInfoViewControllerDelegate>
 }
 
 - (NSPoint)pointForCoord:(VT100GridCoord)coord {
-    return NSMakePoint([iTermPreferences sideMargins] + coord.x * self.charWidth,
-                       coord.y * self.lineHeight);
+    if ([iTermAdvancedSettingsModel naturalRows]) {
+        NSNumber *naturalX = [self.drawingHelper malayalamXForColumn:coord.x line:coord.y];
+        if (naturalX) {
+            return [self malayalamViewPointForDisplayPoint:NSMakePoint(naturalX.doubleValue,
+                [self.drawingHelper displayYForColumn:coord.x sourceRow:coord.y])];
+        }
+    }
+    if ([self hasMalayalamDisplayMap]) {
+        return [self malayalamViewPointForDisplayPoint:NSMakePoint([iTermPreferences sideMargins] + coord.x * self.charWidth,
+            [self.drawingHelper displayYForColumn:coord.x sourceRow:coord.y])];
+    }
+    return NSMakePoint([iTermPreferences sideMargins] + coord.x * self.charWidth, coord.y * self.lineHeight);
 }
 
 - (VT100GridCoord)coordForPointInWindow:(NSPoint)point {
@@ -2437,12 +2487,26 @@ toggleAnimationOfImage:(id<iTermImageInfoReading>)imageInfo {
         return nil;
     }
 
+    iTermTextDrawingHelper *helper = [self newDrawingHelperForOffscreenRendering];
+    [helper didFinishSetup];
+    // Capture owns its geometry; it must not publish a live map outside the frame/scroll transaction.
+    helper.malayalamDisplayMap = [self malayalamDisplayMapForHelper:helper];
+    iTermMalayalamDisplayMap *displayMap = helper.malayalamDisplayMap;
+    NSInteger firstDisplay = displayMap ? [displayMap firstDisplayRowForSourceRow:lineRange.location] : lineRange.location;
+    NSInteger endDisplay = displayMap ? [displayMap firstDisplayRowForSourceRow:endLine] : endLine;
+    if (displayMap.paragraphFlowEnabled) {
+        // A line crossing a source-row seam belongs to both source ranges.
+        iTermMalayalamDisplayFragment *last = [displayMap fragmentForColumn:dataSource.width sourceRow:endLine - 1];
+        if (!last) { return nil; }
+        endDisplay = last.displayRow + 1;
+    }
+
     // Calculate image size. excludeRightGutter renders only the content area
     // (used by streamed/companion frames); otherwise the full view width.
     const CGFloat lineHeight = self.lineHeight;
     const CGFloat imageWidth = excludeRightGutter ? [self widthExcludingRightGutter] : self.frame.size.width;
     const CGFloat vmargin = includeMargins ? [iTermPreferences topBottomMargins] : 0;
-    const CGFloat imageHeight = actualLength * lineHeight + vmargin * 2;
+    const CGFloat imageHeight = (endDisplay - firstDisplay) * lineHeight + vmargin * 2;
 
     if (imageWidth <= 0 || imageHeight <= 0) {
         return nil;
@@ -2486,10 +2550,8 @@ toggleAnimationOfImage:(id<iTermImageInfoReading>)imageInfo {
     // The drawing helper draws in content coordinates where y = lineNumber * lineHeight.
     // virtualOffset shifts content coordinates into the bitmap so the first
     // rendered line (minus any top margin) lands at y=0.
-    const CGFloat virtualOffset = lineRange.location * lineHeight - vmargin;
+    const CGFloat virtualOffset = firstDisplay * lineHeight - vmargin;
     const NSRect contentRect = NSMakeRect(0, virtualOffset, imageWidth, imageHeight);
-
-    iTermTextDrawingHelper *helper = [self newDrawingHelperForOffscreenRendering];
 
     // The offscreen bitmap is always rasterized at `scale` (the retina 2.0
     // fallback when there is no window), but configureDrawingHelper derived
@@ -2527,7 +2589,8 @@ toggleAnimationOfImage:(id<iTermImageInfoReading>)imageInfo {
     }
 
     [helper configureForOffscreenRenderingWithFrame:NSMakeRect(0, 0, imageWidth, imageHeight)
-                                        visibleRect:contentRect];
+                                        visibleRect:contentRect
+                                       renderedRows:NSMakeRange(lineRange.location, actualLength)];
 
     [helper drawTextViewContentInRect:contentRect
                              rectsPtr:&contentRect
@@ -2611,6 +2674,17 @@ toggleAnimationOfImage:(id<iTermImageInfoReading>)imageInfo {
     if (lineHeight <= 0 || imageWidth <= 0) {
         completion(nil);
         return nil;
+    }
+
+    if ([iTermAdvancedSettingsModel malayalamVisualWrap] && [iTermAdvancedSettingsModel naturalRows]) {
+        // Source-line batching assumes one display row per source row. Keep one coherent snapshot instead.
+        iTermBatchedRenderToken *token = [[iTermBatchedRenderToken alloc] initWithLineRange:lineRange
+            batchSize:batchSize lineHeight:lineHeight imageWidth:imageWidth progress:progress completion:completion];
+        token.compositeImage = [self renderLinesToImage:lineRange];
+        token.currentLine = NSMaxRange(lineRange);
+        if (progress && token.compositeImage) { progress(lineRange.length, lineRange.length); }
+        completion(token.compositeImage);
+        return token;  // The API still returns a valid token when completion was synchronous.
     }
 
     iTermBatchedRenderToken *token = [[iTermBatchedRenderToken alloc] initWithLineRange:lineRange

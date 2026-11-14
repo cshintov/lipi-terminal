@@ -9756,6 +9756,12 @@ extendResultsAcrossSoftBoundaries:(BOOL)extendResultsAcrossSoftBoundaries {
 }
 
 - (BOOL)metalAllowed:(out iTermMetalUnavailableReason *)reason {
+    if ([iTermAdvancedSettingsModel naturalRows]) {
+        if (reason) {
+            *reason = iTermMetalUnavailableReasonLigatures;
+        }
+        return NO;
+    }
     static dispatch_once_t onceToken;
     static BOOL machineSupportsMetal;
     dispatch_once(&onceToken, ^{

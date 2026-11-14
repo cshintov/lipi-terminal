@@ -433,6 +433,10 @@ extern const CGFloat PTYTextViewMarginClickGraceWidth;
 // Current selection
 @property(nonatomic, readonly) iTermSelection *selection;
 
+// Experimental footer state uses absolute logical rows, never client cursor commands.
+- (NSDictionary *)malayalamCellStripState;
+- (void)selectMalayalamColumn:(NSInteger)column absoluteRow:(long long)row;
+
 // Draw a highlight along the entire line the cursor is on.
 @property(nonatomic, assign) BOOL highlightCursorLine;
 
@@ -941,3 +945,6 @@ typedef NS_ENUM(NSUInteger, iTermCopyTextStyle) {
 
 @end
 
+@interface PTYTextView (MouseReportingCoordinates)
+- (VT100GridCoord)mouseHandlerCoordForPointInView:(NSPoint)point NS_SWIFT_NAME(clientMouseCell(forViewPoint:));
+@end

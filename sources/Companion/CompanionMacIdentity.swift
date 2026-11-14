@@ -13,7 +13,11 @@ import CompanionNoise
 
 @objc(iTermCompanionMacIdentity)
 final class CompanionMacIdentity: NSObject {
+#if LIPI_TERMINAL
+    private static let service = "io.github.cshintov.lipi-terminal.companion"
+#else
     private static let service = "com.googlecode.iterm2.companion"
+#endif
     private static let account = "mac-noise-static-private-key"
     // The paired phone's static PUBLIC key, the reconnect authentication anchor.
     // Public, so not secret, but it lives in the keychain (not UserDefaults)

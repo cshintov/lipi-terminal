@@ -1,0 +1,23 @@
+Lipi Terminal
+
+Lipi Terminal is an independent experimental fork of iTerm2.
+It is not an official iTerm2 release.
+
+iTerm2 was created by George Nachman and its contributors.
+Upstream project: https://github.com/gnachman/iTerm2
+Upstream documentation: https://iterm2.com
+
+The existing LICENSE and COPYING files are retained without modification.
+LICENSE contains GNU General Public License version 2. COPYING states GPL
+version 2 or later and notes that Apache 2.0-licensed dependencies make the
+combined distribution effectively GPL version 3. Third-party components retain
+their respective licenses and notices; this notice does not replace them.
+
+Fork changes add experimental opt-in Malayalam and Hindi natural-text layout,
+terminal-cell projection, selection/copy and wrapping behavior, responsive table
+layout, and Hindi font selection. The fork's name and packaging distinguish it
+from upstream; no upstream endorsement is implied.
+
+The Lipi icon is AI-generated original artwork, initially created with Grok
+(xAI) and subsequently edited with Qwen-Image. It contains no upstream iTerm2
+artwork. This provenance statement does not add an artwork license.

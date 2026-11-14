@@ -210,7 +210,9 @@ static BOOL hasBecomeActive = NO;
     IBOutlet NSMenuItem *showFullScreenTabs;
     IBOutlet NSMenuItem *useTransparency;
     IBOutlet NSMenuItem *maximizePane;
-    IBOutlet SUUpdater * suUpdater;
+#if !LIPI_TERMINAL
+    SUUpdater *suUpdater;
+#endif
     IBOutlet NSMenuItem *_showTipOfTheDay;  // Here because we must remove it for older OS versions.
     BOOL quittingBecauseLastWindowClosed_;
 
@@ -382,6 +384,12 @@ static NSModalResponse iTermCompareRenderingRunModal(id self, SEL _cmd) {
 #pragma mark - Interface Builder
 
 - (void)awakeFromNib {
+#if LIPI_TERMINAL
+    [self menuItemWithAction:@selector(checkForUpdatesFromMenu:) inMenu:NSApp.mainMenu].hidden = YES;
+#else
+    // Do not instantiate Sparkle from the nib: a Lipi build must never start its update cycle.
+    suUpdater = [SUUpdater sharedUpdater];
+#endif
     [ArchivesMenuBuilder setShared:[[ArchivesMenuBuilder alloc] initWithMenuItem:_archivesMenuItem]];
 
     NSMenu *viewMenu = [self topLevelViewWithIdentifier:@"View"];
@@ -1396,9 +1404,12 @@ void TurnOnDebugLoggingAutomatically(void) {
     // about another instance would stall each one after the first.
     if (![NSApp isRunningUnitTests]) {
         [iTermInstanceLock resolveConflictIfNeeded];
-    } else {
+    }
+#if !LIPI_TERMINAL
+    if ([NSApp isRunningUnitTests]) {
         suUpdater.delegate = (id<SUUpdaterDelegate>)[iTermTestHostIsolation updaterDelegate];
     }
+#endif
     [[iTermApplication sharedApplication] updateAppearance];
     [[iTermUserDefaults userDefaults] it_addObserverForKey:kPreferenceKeyTabStyle
                                                      block:^(id _Nonnull newValue) {
@@ -1961,11 +1972,13 @@ static iTermKeyEventReplayer *gReplayer;
 
     [[iTermBuriedSessions sharedInstance] setMenus:[NSArray arrayWithObjects:_buriedSessions, _statusIconBuriedSessions, nil]];
 
+#if !LIPI_TERMINAL
     item = [[[NSMenuItem alloc] initWithTitle:NSLocalizedStringWithDefaultValue(@"StatusMenu.CheckForUpdates", nil, [NSBundle mainBundle], @"Check For Updates", @"Status-icon menu item to check for updates")
                                        action:@selector(checkForUpdatesFromMenu:)
                                 keyEquivalent:@""] autorelease];
     [menu addItem:item];
 
+#endif
     NSMenuItem *mainMenuItem = [[[NSMenuItem alloc] initWithTitle:NSLocalizedStringWithDefaultValue(@"StatusMenu.MainMenu", nil, [NSBundle mainBundle], @"Main Menu", @"Status-icon submenu title mirroring the main menu") action:nil keyEquivalent:@""] autorelease];
     mainMenuItem.identifier = @"iTermStatusMenuMainMenu";
     mainMenuItem.submenu = [[NSApp mainMenu] it_deepCopy];
@@ -2544,6 +2557,7 @@ static iTermKeyEventReplayer *gReplayer;
 #pragma mark - Startup Helpers
 
 - (void)complainIfNightlyBuildIsTooOld {
+#if !LIPI_TERMINAL
     if (![NSBundle it_isNightlyBuild]) {
         return;
     }
@@ -2559,6 +2573,7 @@ static iTermKeyEventReplayer *gReplayer;
             [[SUUpdater sharedUpdater] checkForUpdates:nil];
         }
     }
+#endif
 }
 
 // This performs startup activities as long as they haven't been run before.
@@ -2704,7 +2719,9 @@ static iTermKeyEventReplayer *gReplayer;
 }
 
 - (IBAction)checkForUpdatesFromMenu:(id)sender {
-    [suUpdater checkForUpdates:(sender)];
+#if !LIPI_TERMINAL
+    [suUpdater checkForUpdates:sender];
+#endif
 }
 
 // Depth-first search for the menu item wired to a given action, so a
