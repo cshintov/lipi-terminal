@@ -5,7 +5,7 @@
 Lipi Terminal is an experimental [iTerm2](https://iterm2.com) fork for macOS that
 renders Malayalam and Hindi with naturally shaped text.
 
-<!-- Add the approved Malayalam/Hindi demo screenshot here. -->
+![Same Malayalam and Hindi text in Lipi Terminal: natural text disabled at left and enabled at right.](docs/images/lipi-before-after.png)
 
 ## Install
 
