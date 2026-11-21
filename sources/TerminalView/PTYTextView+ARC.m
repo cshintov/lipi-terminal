@@ -2494,8 +2494,8 @@ toggleAnimationOfImage:(id<iTermImageInfoReading>)imageInfo {
     iTermMalayalamDisplayMap *displayMap = helper.malayalamDisplayMap;
     NSInteger firstDisplay = displayMap ? [displayMap firstDisplayRowForSourceRow:lineRange.location] : lineRange.location;
     NSInteger endDisplay = displayMap ? [displayMap firstDisplayRowForSourceRow:endLine] : endLine;
-    if (displayMap.paragraphFlowEnabled) {
-        // A line crossing a source-row seam belongs to both source ranges.
+    if (displayMap) {
+        // A line crossing a source-row seam (a soft-wrapped or client-flowed paragraph) belongs to both source ranges.
         iTermMalayalamDisplayFragment *last = [displayMap fragmentForColumn:dataSource.width sourceRow:endLine - 1];
         if (!last) { return nil; }
         endDisplay = last.displayRow + 1;

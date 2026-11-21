@@ -65,6 +65,94 @@ import Foundation
     }
 }
 
+/// A piece of an anchored row. `rawStart...rawEnd` is its x range in the one shaped line; it is drawn
+/// at `origin`, stretched horizontally by `scale`.
+@objcMembers final class iTermMalayalamAnchoredSegment: NSObject {
+    let utf16Range: NSRange
+    let rawStart: CGFloat
+    let rawEnd: CGFloat
+    let origin: CGFloat
+    let scale: CGFloat
+    let isAnchor: Bool
+
+    init(range: NSRange, rawStart: CGFloat, rawEnd: CGFloat, origin: CGFloat, scale: CGFloat, isAnchor: Bool) {
+        utf16Range = range
+        self.rawStart = rawStart
+        self.rawEnd = rawEnd
+        self.origin = origin
+        self.scale = scale
+        self.isAnchor = isAnchor
+    }
+
+    func x(forRaw raw: CGFloat) -> CGFloat { origin + scale * (raw - rawStart) }
+    var drawnEnd: CGFloat { x(forRaw: rawEnd) }
+}
+
+/// "Natural text, anchored columns": a row with structural border cells keeps its natural shaping, but each
+/// border cell sits at its true column x and the text after it starts at its own column x. Text between two
+/// borders is condensed just enough to fit the cells it owns; narrower text keeps its natural width.
+@objcMembers final class iTermMalayalamAnchoredGeometry: NSObject {
+    let segments: [iTermMalayalamAnchoredSegment]
+    let extent: CGFloat
+
+    /// The single definition of a structural anchor: a cell holding one vertical or junction box-drawing
+    /// character, so U+2500...U+257F without the pure horizontals.
+    static func isAnchor(cell: String) -> Bool {
+        let scalars = cell.unicodeScalars
+        guard scalars.count == 1, let scalar = scalars.first, (0x2500...0x257f).contains(scalar.value) else { return false }
+        return ![0x2500, 0x2501, 0x2504, 0x2505, 0x2508, 0x2509, 0x254c, 0x254d, 0x2550,
+                 0x2574, 0x2576, 0x2578, 0x257a, 0x257c, 0x257e].contains(scalar.value)
+    }
+
+    /// Nil when the row has no anchor cell or `cellWidth` is not positive.
+    init?(line: CTLine, text: NSString, boundaries: [NSNumber], cellWidth: CGFloat) {
+        guard cellWidth > 0, cellWidth.isFinite, boundaries.count > 1 else { return nil }
+        let count = boundaries.count - 1
+        func range(_ first: Int, _ end: Int) -> NSRange {
+            NSRange(location: boundaries[first].intValue, length: boundaries[end].intValue - boundaries[first].intValue)
+        }
+        let anchors = (0..<count).filter { column in
+            let cell = range(column, column + 1)
+            return cell.length > 0 && iTermMalayalamAnchoredGeometry.isAnchor(cell: text.substring(with: cell))
+        }
+        guard !anchors.isEmpty else { return nil }
+        var pieces: [iTermMalayalamAnchoredSegment] = []
+        func add(_ first: Int, _ end: Int, anchor: Bool) {
+            let source = range(first, end)
+            guard source.length > 0 else { return }
+            let start = CTLineGetOffsetForStringIndex(line, source.location, nil)
+            let finish = CTLineGetOffsetForStringIndex(line, NSMaxRange(source), nil)
+            let natural = finish - start
+            // Text only condenses; an anchor fills exactly its own cell.
+            let span = CGFloat(end - first) * cellWidth
+            let scale = natural > 0 && (anchor || natural > span) ? span / natural : 1
+            pieces.append(iTermMalayalamAnchoredSegment(range: source, rawStart: start, rawEnd: finish,
+                origin: CGFloat(first) * cellWidth, scale: scale, isAnchor: anchor))
+        }
+        var next = 0
+        for column in anchors {
+            add(next, column, anchor: false)
+            add(column, column + 1, anchor: true)
+            next = column + 1
+        }
+        add(next, count, anchor: false)
+        segments = pieces
+        extent = pieces.map(\.drawnEnd).max() ?? 0
+        super.init()
+    }
+
+    func segment(containingUTF16 index: Int) -> iTermMalayalamAnchoredSegment? {
+        segments.first { NSLocationInRange(index, $0.utf16Range) }
+    }
+
+    /// A native edge belongs to the character it describes. A boundary shared by a text segment's end and the
+    /// next anchor's start therefore has two edges: the text's own end and the anchor's column x.
+    func mapped(_ edge: iTermMalayalamNativeEdge) -> iTermMalayalamNativeEdge {
+        guard let piece = segment(containingUTF16: edge.utf16Index) else { return edge }
+        return iTermMalayalamNativeEdge(x: piece.x(forRaw: edge.x), utf16Index: edge.utf16Index, leading: edge.leading)
+    }
+}
+
 /// Natural row geometry. Terminal cell ownership is supplied by the caller.
 @objc(iTermMalayalamRowLayout)
 final class iTermMalayalamRowLayout: NSObject {
@@ -72,13 +160,32 @@ final class iTermMalayalamRowLayout: NSObject {
     @objc let cellUTF16Boundaries: [NSNumber]
     @objc let line: CTLine
     @objc let naturalWidth: CGFloat
+    /// Set for rows with structural border cells when the caller supplied a cell width.
+    @objc let anchoredGeometry: iTermMalayalamAnchoredGeometry?
+    @objc let anchorCellWidth: CGFloat
+    /// Uncolored geometry validated against this immutable painted layout.
+    @objc let selectionBaseline: iTermMalayalamRowLayout?
     let trailingPlainSpaceStart: Int
     @objc let nativeEdges: [iTermMalayalamNativeEdge]
     private let clusterBoundaries: [Int]
     private let resolvedEdges: [Int: iTermMalayalamNativeEdge]
     private let logicalColumnsByIndex: [Int: [NSNumber]]
+    private let firstBoundaryByExactX: [CGFloat: Int]
 
-    @objc init?(attributedString: NSAttributedString, cellUTF16Boundaries: [NSNumber]) {
+    @objc convenience init?(attributedString: NSAttributedString, cellUTF16Boundaries: [NSNumber]) {
+        self.init(attributedString: attributedString, cellUTF16Boundaries: cellUTF16Boundaries, cellWidth: 0)
+    }
+
+    /// A positive `cellWidth` anchors structural border cells at their true columns.
+    @objc convenience init?(attributedString: NSAttributedString, cellUTF16Boundaries: [NSNumber], cellWidth: CGFloat) {
+        self.init(attributedString: attributedString, cellUTF16Boundaries: cellUTF16Boundaries,
+                  cellWidth: cellWidth, selectionBaseline: nil)
+    }
+
+    @objc init?(attributedString: NSAttributedString, cellUTF16Boundaries: [NSNumber], cellWidth: CGFloat,
+                selectionBaseline: iTermMalayalamRowLayout?) {
+        guard selectionBaseline?.selectionBaseline == nil else { return nil }
+        self.selectionBaseline = selectionBaseline
         let text = attributedString.string as NSString
         guard cellUTF16Boundaries.first == 0,
               cellUTF16Boundaries.last?.intValue == text.length else { return nil }
@@ -97,7 +204,11 @@ final class iTermMalayalamRowLayout: NSObject {
         self.attributedString = attributedString.copy() as! NSAttributedString
         self.cellUTF16Boundaries = cellUTF16Boundaries
         line = CTLineCreateWithAttributedString(self.attributedString)
-        naturalWidth = CTLineGetTypographicBounds(line, nil, nil, nil)
+        anchorCellWidth = cellWidth
+        let anchored = iTermMalayalamAnchoredGeometry(line: line, text: text, boundaries: cellUTF16Boundaries,
+                                                      cellWidth: cellWidth)
+        anchoredGeometry = anchored
+        naturalWidth = anchored?.extent ?? CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
         var padding = text.length
         let underline = NSAttributedString.Key("iTermMalayalamUnderlineAttribute")
         while padding > 0 && text.character(at: padding - 1) == 0x20 {
@@ -121,7 +232,6 @@ final class iTermMalayalamRowLayout: NSObject {
                 edges.append(iTermMalayalamNativeEdge(x: x, utf16Index: index, leading: leading))
             }
         }
-        nativeEdges = edges
         let string = self.attributedString.string
         // Display spans may contain several graphemes. They never change terminal cells.
         let graphemes = Self.graphemeBoundaries(string)
@@ -131,13 +241,28 @@ final class iTermMalayalamRowLayout: NSObject {
                                                      textLength: text.length)
         }
         clusterBoundaries = Self.displayBoundaries(graphemes, resolved: resolved, edges: edges)
+        // Cluster decisions use the shaped line; every reported x then follows the anchored columns.
+        if let anchored {
+            edges = edges.map(anchored.mapped)
+            resolved = resolved.mapValues(anchored.mapped)
+        }
+        nativeEdges = edges
         resolvedEdges = resolved
+        var exactBoundaries: [CGFloat: Int] = [:]
+        for index in clusterBoundaries {
+            if let edge = resolved[index], exactBoundaries[edge.x] == nil {
+                // Keep the first source boundary when several native edges share an x.
+                exactBoundaries[edge.x] = index
+            }
+        }
+        firstBoundaryByExactX = exactBoundaries
         var columns: [Int: [NSNumber]] = [:]
         for (column, offset) in cellUTF16Boundaries.enumerated() {
             columns[offset.intValue, default: []].append(NSNumber(value: column))
         }
         logicalColumnsByIndex = columns
         super.init()
+        if let selectionBaseline, !hasEquivalentGeometry(to: selectionBaseline) { return nil }
     }
 
     private static func graphemeBoundaries(_ text: String) -> [Int] {
@@ -236,6 +361,9 @@ final class iTermMalayalamRowLayout: NSObject {
                 // Reporting owns the ASCII cell interval; selection still chooses the nearest caret.
                 return iTermMalayalamRowHit(index: index, columns: columns, edge: leading)
             }
+        }
+        if let index = firstBoundaryByExactX[nativeX], let edge = resolvedEdges[index] {
+            return iTermMalayalamRowHit(index: index, columns: logicalColumnsByIndex[index] ?? [], edge: edge)
         }
         var bestIndex: Int?
         var bestEdge: iTermMalayalamNativeEdge?
@@ -392,7 +520,8 @@ final class iTermMalayalamRowLayout: NSObject {
         retainsTrailingPadding = retainedPadding
         self.paragraph = paragraph
         self.tableRow = tableRow; self.tableCellWidth = tableCellWidth
-        let ink = layout.map { CTLineGetBoundsWithOptions($0.line, .useGlyphPathBounds) } ?? .zero
+        // Anchored rows start at their true column x, so ink overhang never shifts them.
+        let ink = layout.map { $0.anchoredGeometry == nil ? CTLineGetBoundsWithOptions($0.line, .useGlyphPathBounds) : .null } ?? .zero
         originX = indent + (exactOrigin || ink.isNull ? 0 : max(0, -ink.minX))
     }
 
@@ -430,18 +559,28 @@ final class iTermMalayalamRowLayout: NSObject {
         let boundaries = source.cellUTF16Boundaries[firstColumn...endColumn].map {
             NSNumber(value: $0.intValue - base)
         }
-        return iTermMalayalamRowLayout(attributedString: attributed, cellUTF16Boundaries: boundaries)
+        return iTermMalayalamRowLayout(attributedString: attributed, cellUTF16Boundaries: boundaries,
+                                       cellWidth: layout?.anchorCellWidth ?? 0)
     }
 }
 
 /// Document presentation only. It never owns or changes terminal cells.
 @objcMembers final class iTermMalayalamDisplayMap: NSObject {
     let sourceRowCount: Int
+    /// Source rows before this index are not laid out: each is one plain display row and has no fragment object.
+    /// `fragments` and `starts` cover only the source rows from here on; every public row number is absolute.
+    let leadingRows: Int
     private(set) var displayRowCount: Int
     private(set) var fragments: [iTermMalayalamDisplayFragment]
     private var starts: [Int]
     private var paragraphRanges: [Int: Range<Int>] = [:]
+    /// The guessed client-prose joins were on when the map was built. Soft-wrap joins need no setting.
     private(set) var paragraphFlowEnabled = false
+    private var hasSourceRows = false
+    private var joinedContinuationRows = Set<Int>()
+
+    /// A row without natural script that was laid out as the continuation of the natural-script row above it.
+    @objc func isJoinedContinuationRow(_ row: Int) -> Bool { joinedContinuationRows.contains(row) }
     private var paragraphEols: [NSNumber] = []
     private var paragraphTexts: [String] = []
     private let sourceLayouts: [NSNumber: iTermMalayalamRowLayout]
@@ -455,15 +594,19 @@ final class iTermMalayalamRowLayout: NSObject {
 
     convenience init?(rows: [NSNumber: iTermMalayalamRowLayout], rowCount: Int, columns: Int, width: CGFloat,
                       sourceEols: [NSNumber]?, sourceTexts: [String]?, tableSources: [NSNumber: iTermMalayalamTableSource],
-                      cellWidth: CGFloat, previousMap: iTermMalayalamDisplayMap?) {
-        guard (sourceEols == nil) == (sourceTexts == nil),
-              sourceEols == nil || (sourceEols?.count == rowCount && sourceTexts?.count == rowCount) else { return nil }
+                      cellWidth: CGFloat, leadingRows: Int = 0, continuationRows: Set<Int> = [],
+                      previousMap: iTermMalayalamDisplayMap?) {
+        guard (sourceEols == nil) == (sourceTexts == nil), leadingRows >= 0, leadingRows < rowCount,
+              sourceEols == nil || (sourceEols?.count == rowCount - leadingRows &&
+                                    sourceTexts?.count == rowCount - leadingRows) else { return nil }
+        // Source arrays describe only the laid-out rows, from `leadingRows` on.
         let sources = sourceEols.flatMap { eols in sourceTexts.map { texts in
-            (0..<rowCount).map { iTermMalayalamProseSourceRow(row: $0, layout: rows[NSNumber(value: $0)],
-                eol: eols[$0].int32Value, rawText: texts[$0]) }
+            (leadingRows..<rowCount).map { iTermMalayalamProseSourceRow(row: $0, layout: rows[NSNumber(value: $0)],
+                eol: eols[$0 - leadingRows].int32Value, rawText: texts[$0 - leadingRows]) }
         }}
         self.init(rows: rows, rowCount: rowCount, columns: columns, width: width, previousMap: previousMap,
-                  sourceRows: sources, tableSources: tableSources, cellWidth: cellWidth)
+                  sourceRows: sources, tableSources: tableSources, cellWidth: cellWidth, leadingRows: leadingRows,
+                  continuationRows: continuationRows)
         paragraphEols = sourceEols ?? []; paragraphTexts = sourceTexts ?? []
     }
 
@@ -477,27 +620,44 @@ final class iTermMalayalamRowLayout: NSObject {
     }
 
     convenience init?(rows: [NSNumber: iTermMalayalamRowLayout], rowCount: Int, columns: Int, width: CGFloat,
-                      sourceEols: [NSNumber], sourceTexts: [String], previousMap: iTermMalayalamDisplayMap?) {
-        guard sourceEols.count == rowCount, sourceTexts.count == rowCount else { return nil }
-        let sourceRows = (0..<rowCount).map {
+                      sourceEols: [NSNumber], sourceTexts: [String], leadingRows: Int = 0,
+                      continuationRows: Set<Int> = [], previousMap: iTermMalayalamDisplayMap?) {
+        guard leadingRows >= 0, leadingRows < rowCount, sourceEols.count == rowCount - leadingRows,
+              sourceTexts.count == rowCount - leadingRows else { return nil }
+        let sourceRows = (leadingRows..<rowCount).map {
             iTermMalayalamProseSourceRow(row: $0, layout: rows[NSNumber(value: $0)],
-                eol: sourceEols[$0].int32Value, rawText: sourceTexts[$0])
+                eol: sourceEols[$0 - leadingRows].int32Value, rawText: sourceTexts[$0 - leadingRows])
         }
         self.init(rows: rows, rowCount: rowCount, columns: columns, width: width,
-                  previousMap: previousMap, sourceRows: sourceRows)
+                  previousMap: previousMap, sourceRows: sourceRows, leadingRows: leadingRows,
+                  continuationRows: continuationRows)
         paragraphEols = sourceEols
         paragraphTexts = sourceTexts
     }
 
     func matchesParagraphRows(_ rows: [NSNumber: iTermMalayalamRowLayout], rowCount: Int, columns: Int,
-                              width: CGFloat, sourceEols: [NSNumber], sourceTexts: [String]) -> Bool {
-        paragraphFlowEnabled && paragraphEols == sourceEols && paragraphTexts == sourceTexts &&
-            matches(rows: rows, rowCount: rowCount, columns: columns, width: width)
+                              width: CGFloat, sourceEols: [NSNumber], sourceTexts: [String],
+                              leadingRows: Int = 0) -> Bool {
+        hasSourceRows && paragraphFlowEnabled == iTermAdvancedSettingsModel.malayalamParagraphFlow() &&
+            paragraphEols == sourceEols && paragraphTexts == sourceTexts &&
+            matches(rows: rows, rowCount: rowCount, columns: columns, width: width, leadingRows: leadingRows)
     }
 
     func lastSourceRow(atDisplayRow row: Int) -> Int {
-        let fragment = fragments[min(fragments.count - 1, max(0, row))]
+        if row < leadingRows { return max(0, row) }
+        let fragment = fragments[min(fragments.count - 1, row - leadingRows)]
         return fragment.paragraph?.lastSourceRow ?? fragment.sourceRow
+    }
+
+    /// The fragment drawn on a display row. Rows before `leadingRows` get a plain single-row fragment.
+    func fragment(atDisplayRow row: Int) -> iTermMalayalamDisplayFragment {
+        if row < leadingRows { return plainFragment(row: max(0, row)) }
+        return fragments[min(fragments.count - 1, row - leadingRows)]
+    }
+
+    private func plainFragment(row: Int) -> iTermMalayalamDisplayFragment {
+        iTermMalayalamDisplayFragment(row: row, first: 0, end: columns, display: row,
+                                      range: NSRange(location: 0, length: 0), layout: nil)
     }
 
     @objc(sourceLayoutForRow:)
@@ -505,10 +665,10 @@ final class iTermMalayalamRowLayout: NSObject {
         tableRows[row]?.source.layout ?? sourceLayouts[NSNumber(value: row)]
     }
 
-    @objc(matchesRows:rowCount:columns:width:)
+    @objc(matchesRows:rowCount:columns:width:leadingRows:)
     func matches(rows: [NSNumber: iTermMalayalamRowLayout], rowCount: Int,
-                 columns: Int, width: CGFloat) -> Bool {
-        rowCount == sourceRowCount && columns == self.columns && width == self.width &&
+                 columns: Int, width: CGFloat, leadingRows: Int = 0) -> Bool {
+        rowCount == sourceRowCount && leadingRows == self.leadingRows && columns == self.columns && width == self.width &&
             rows.count == sourceLayouts.count && rows.allSatisfy { key, layout in
                 sourceLayouts[key] === layout
             }
@@ -519,19 +679,21 @@ final class iTermMalayalamRowLayout: NSObject {
     }
 
     convenience init?(rows: [NSNumber: iTermMalayalamRowLayout], rowCount: Int, columns: Int, width: CGFloat,
-                      previousMap: iTermMalayalamDisplayMap?) {
-        self.init(rows: rows, rowCount: rowCount, columns: columns, width: width, previousMap: previousMap, sourceRows: nil)
+                      leadingRows: Int = 0, previousMap: iTermMalayalamDisplayMap?) {
+        self.init(rows: rows, rowCount: rowCount, columns: columns, width: width, previousMap: previousMap,
+                  sourceRows: nil, leadingRows: leadingRows)
     }
 
     private init?(rows: [NSNumber: iTermMalayalamRowLayout], rowCount: Int, columns: Int, width: CGFloat,
                   previousMap: iTermMalayalamDisplayMap?, sourceRows: [iTermMalayalamProseSourceRow]?,
-                  tableSources: [NSNumber: iTermMalayalamTableSource] = [:], cellWidth: CGFloat = 0) {
-        guard rowCount > 0, columns > 0, width.isFinite, width > 0 else { return nil }
+                  tableSources: [NSNumber: iTermMalayalamTableSource] = [:], cellWidth: CGFloat = 0,
+                  leadingRows: Int = 0, continuationRows: Set<Int> = []) {
+        guard rowCount > 0, leadingRows >= 0, leadingRows < rowCount, columns > 0, width.isFinite, width > 0 else { return nil }
         let tableRows = iTermMalayalamTableRow.groups(tableSources, width: width, cellWidth: cellWidth)
         // Source layouts are immutable. Reuse geometry, never old document/display coordinates.
         var reusable: [ObjectIdentifier: [iTermMalayalamDisplayFragment]] = [:]
         if let previousMap, previousMap.columns == columns, previousMap.width == width {
-            for row in 0..<previousMap.sourceRowCount {
+            for row in previousMap.leadingRows..<previousMap.sourceRowCount {
                 if let source = previousMap.sourceLayout(forRow: row) {
                     let pieces = previousMap.fragments(forSourceRow: row)
                     if pieces.first?.paragraph == nil && pieces.first?.tableRow == nil { reusable[ObjectIdentifier(source)] = pieces }
@@ -540,10 +702,16 @@ final class iTermMalayalamRowLayout: NSObject {
         }
         var paragraphs: [Int: iTermMalayalamProseParagraph] = [:]
         var currentFacts: [ObjectIdentifier: iTermMalayalamProseFacts] = [:]
+        // Guessed client-prose joins are an explicit opt-in. A terminal soft wrap is a fact and always joins.
+        let clientProse = iTermAdvancedSettingsModel.malayalamParagraphFlow()
         if let sourceRows {
-            // Only the explicit prose policy needs classification, never fragment or wrap-only layouts.
+            // Table rows are laid out as tables, so they end any run of rows to join.
             let sourceRows = sourceRows.map { source -> iTermMalayalamProseSourceRow in
-                guard let layout = source.layout else { return source }
+                guard let layout = source.layout, tableRows[source.row] == nil else {
+                    return iTermMalayalamProseSourceRow(row: source.row, layout: nil, eol: source.eol, rawText: source.rawText)
+                }
+                // Only the explicit prose policy needs classification, never fragment or wrap-only layouts.
+                guard clientProse else { return source }
                 let key = ObjectIdentifier(layout)
                 let saved = currentFacts[key] ?? previousMap?.proseFacts[key]
                 guard saved != nil || source.indent > 0 else { return source }
@@ -561,21 +729,30 @@ final class iTermMalayalamRowLayout: NSObject {
                 }
             }
             for group in iTermMalayalamProseFlow.groups(sourceRows, columns: columns, width: width,
-                clientProse: true, previousParagraphs: previousParagraphs) {
+                clientProse: clientProse, softWraps: true, previousParagraphs: previousParagraphs) {
                 if let paragraph = group.paragraph {
                     for source in group.rows { paragraphs[source.row] = paragraph }
                 }
             }
         }
+        // A continuation row (no natural script of its own) is only laid out as part of a paragraph. Where its
+        // paragraph did not form, it stays the plain row it was before.
+        var layoutRows = rows
+        var joinedContinuations = Set<Int>()
+        for row in continuationRows {
+            if paragraphs[row] != nil { joinedContinuations.insert(row) }
+            else { layoutRows.removeValue(forKey: NSNumber(value: row)) }
+        }
+        joinedContinuationRows = joinedContinuations
         var result: [iTermMalayalamDisplayFragment] = []
         var rowStarts: [Int] = []
         var ranges: [Int: Range<Int>] = [:]
-        for row in 0..<rowCount {
+        for row in leadingRows..<rowCount {
             if let table = tableRows[row] {
-                rowStarts.append(result.count); table.displayStart = result.count
+                rowStarts.append(result.count); table.displayStart = leadingRows + result.count
                 for _ in 0..<table.height {
                     result.append(iTermMalayalamDisplayFragment(row: row, first: 0, end: columns,
-                        display: result.count, range: NSRange(location: 0, length: table.source.layout.attributedString.length),
+                        display: leadingRows + result.count, range: NSRange(location: 0, length: table.source.layout.attributedString.length),
                         layout: nil, oversized: table.oversized, tableRow: table))
                 }
                 continue
@@ -586,7 +763,7 @@ final class iTermMalayalamRowLayout: NSObject {
                     rowStarts.append(first)
                     for piece in paragraph.map.fragments {
                         result.append(iTermMalayalamDisplayFragment(row: row, first: piece.firstColumn,
-                            end: piece.endColumn, display: result.count, range: piece.sourceRange, layout: piece.layout,
+                            end: piece.endColumn, display: leadingRows + result.count, range: piece.sourceRange, layout: piece.layout,
                             oversized: piece.oversizedCluster, paragraph: paragraph, indent: paragraph.indentWidth))
                     }
                     for source in paragraph.rows { ranges[source.row] = first..<result.count }
@@ -598,20 +775,27 @@ final class iTermMalayalamRowLayout: NSObject {
                 continue
             }
             rowStarts.append(result.count)
-            guard let source = rows[NSNumber(value: row)] else {
+            guard let source = layoutRows[NSNumber(value: row)] else {
                 result.append(iTermMalayalamDisplayFragment(row: row, first: 0, end: columns,
-                    display: result.count, range: NSRange(location: 0, length: 0), layout: nil))
+                    display: leadingRows + result.count, range: NSRange(location: 0, length: 0), layout: nil))
                 continue
             }
             if let pieces = reusable[ObjectIdentifier(source)] {
                 for piece in pieces {
                     result.append(iTermMalayalamDisplayFragment(row: row, first: piece.firstColumn, end: piece.endColumn,
-                        display: result.count, range: piece.sourceRange, layout: piece.layout,
+                        display: leadingRows + result.count, range: piece.sourceRange, layout: piece.layout,
                         oversized: piece.oversizedCluster, retainedPadding: piece.retainsTrailingPadding))
                 }
                 continue
             }
             let length = source.attributedString.length
+            if source.anchoredGeometry != nil {
+                // Anchored text already fits between its borders, so the row never wraps.
+                result.append(iTermMalayalamDisplayFragment(row: row, first: 0, end: source.cellUTF16Boundaries.count - 1,
+                    display: leadingRows + result.count, range: NSRange(location: 0, length: length), layout: source,
+                    retainedPadding: source.trailingPlainSpaceStart < length))
+                continue
+            }
             let typesetter = CTTypesetterCreateWithAttributedString(source.attributedString)
             let legal = source.cellUTF16Boundaries.enumerated().compactMap { column, offset -> Int? in
                 source.projection(atColumn: column)?.kind == .nativeEdge ? offset.intValue : nil
@@ -637,14 +821,14 @@ final class iTermMalayalamRowLayout: NSObject {
                         attributedString: source.attributedString.attributedSubstring(from: range),
                         cellUTF16Boundaries: boundaries) else { return nil }
                     let fragment = iTermMalayalamDisplayFragment(row: row, first: firstColumn, end: endColumn,
-                        display: result.count, range: range, layout: piece)
+                        display: leadingRows + result.count, range: range, layout: piece)
                     let ink = CTLineGetBoundsWithOptions(piece.line, .useGlyphPathBounds)
                     let flowEnd = end == length ? max(0, source.trailingPlainSpaceStart - start) : range.length
                     let advance = flowEnd < range.length ? CTLineGetOffsetForStringIndex(piece.line, flowEnd, nil) : piece.naturalWidth
                     let extent = fragment.originX + max(advance, ink.isNull ? 0 : ink.maxX)
                     if extent <= width || end == next {
                         chosen = iTermMalayalamDisplayFragment(row: row, first: firstColumn, end: endColumn,
-                            display: result.count, range: range, layout: piece, oversized: extent > width,
+                            display: leadingRows + result.count, range: range, layout: piece, oversized: extent > width,
                             retainedPadding: end == length && source.trailingPlainSpaceStart < length)
                         break
                     }
@@ -663,28 +847,33 @@ final class iTermMalayalamRowLayout: NSObject {
         self.columns = columns
         self.width = width
         sourceRowCount = rowCount
-        displayRowCount = result.count
+        self.leadingRows = leadingRows
+        displayRowCount = leadingRows + result.count
         fragments = result
         starts = rowStarts
         paragraphRanges = ranges
-        paragraphFlowEnabled = sourceRows != nil
+        hasSourceRows = sourceRows != nil
+        paragraphFlowEnabled = sourceRows != nil && clientProse
         super.init()
     }
 
     func firstDisplayRow(forSourceRow row: Int) -> Int {
         if row >= sourceRowCount { return displayRowCount }
-        return starts[max(0, row)]
+        if row < leadingRows { return max(0, row) }
+        return leadingRows + starts[row - leadingRows]
     }
 
     func sourceRow(atDisplayRow row: Int) -> Int {
-        fragments[min(fragments.count - 1, max(0, row))].sourceRow
+        if row < leadingRows { return max(0, row) }
+        return fragments[min(fragments.count - 1, row - leadingRows)].sourceRow
     }
 
     func fragments(forSourceRow row: Int) -> [iTermMalayalamDisplayFragment] {
         guard row >= 0, row < sourceRowCount else { return [] }
+        if row < leadingRows { return [plainFragment(row: row)] }
         if let range = paragraphRanges[row] { return Array(fragments[range]) }
-        let start = starts[row]
-        let end = row + 1 < sourceRowCount ? starts[row + 1] : fragments.count
+        let start = starts[row - leadingRows]
+        let end = row + 1 < sourceRowCount ? starts[row + 1 - leadingRows] : fragments.count
         return Array(fragments[start..<end])
     }
 
@@ -769,9 +958,47 @@ struct iTermMalayalamProseSourceRow {
         }.map { $0 + 1 } ?? 0
     }
 
+    /// Only a repeated client quote prefix may collapse into the preceding quoted paragraph.
+    var quotePrefixColumns: Int? {
+        guard let layout else { return nil }
+        let first = indent
+        let columns = layout.cellUTF16Boundaries.count - 1
+        guard first + 1 < columns,
+              (layout.attributedString.string as NSString).substring(with: cellRange(first)) == "▎",
+              cellContainsOnlySpaces(first + 1) else { return nil }
+        var end = first + 2
+        while end < columns && cellContainsOnlySpaces(end) { end += 1 }
+        return end < usedColumns ? end : nil
+    }
+
+    var hasQuotedLeadingIcon: Bool {
+        guard let layout, let column = quotePrefixColumns else { return false }
+        let cell = (layout.attributedString.string as NSString).substring(with: cellRange(column))
+        return cell.unicodeScalars.first?.properties.isEmojiPresentation == true
+    }
+
+    private var proseStartColumn: Int {
+        guard var column = quotePrefixColumns else { return indent }
+        if hasQuotedLeadingIcon {
+            column += 1
+            while column < usedColumns && (cellRange(column).length == 0 || cellContainsOnlySpaces(column)) {
+                column += 1
+            }
+        }
+        return column
+    }
+
+    var proseText: String {
+        // ASCII code fences have no natural layout, but still delimit quoted prose.
+        let text = paintedText
+        let body = text.drop(while: { $0 == " " })
+        guard body.first == "▎", body.dropFirst().first == " " else { return text }
+        return String(body.dropFirst().drop(while: { $0 == " " }))
+    }
+
     var firstWordCellWidth: Int {
         if let cachedFacts, cachedFacts.layout === layout { return cachedFacts.firstWordCellWidth }
-        let firstColumn = indent
+        let firstColumn = proseStartColumn
         let endColumn = usedColumns
         guard firstColumn < endColumn else { return 0 }
         for column in firstColumn..<endColumn {
@@ -783,7 +1010,7 @@ struct iTermMalayalamProseSourceRow {
     var isPlainProse: Bool {
         if let cachedFacts, cachedFacts.layout === layout { return cachedFacts.isPlainProse }
         guard let layout else { return false }
-        let firstColumn = indent
+        let firstColumn = proseStartColumn
         let endColumn = usedColumns
         guard firstColumn < endColumn else { return false }
         let start = layout.cellUTF16Boundaries[firstColumn].intValue
@@ -836,24 +1063,28 @@ struct iTermMalayalamProseSpan {
     let layout: iTermMalayalamRowLayout
     let map: iTermMalayalamDisplayMap
     private let viewportWidth: CGFloat
+    /// Rows joined only because the terminal soft-wrapped them: no client indent, every cell kept in place.
+    let softOnly: Bool
 
     // Only immutable geometry is shared. Each wrapper below keeps the current source row IDs.
-    func matchesGeometryInputs(_ source: [iTermMalayalamProseSourceRow], columns: Int, width: CGFloat) -> Bool {
-        self.columns == columns && viewportWidth == width && rows.count == source.count &&
+    func matchesGeometryInputs(_ source: [iTermMalayalamProseSourceRow], columns: Int, width: CGFloat,
+                               softOnly: Bool = false) -> Bool {
+        self.softOnly == softOnly && self.columns == columns && viewportWidth == width && rows.count == source.count &&
             zip(rows, source).allSatisfy { old, current in old.layout === current.layout && old.eol == current.eol }
     }
 
     init?(rows: [iTermMalayalamProseSourceRow], columns: Int, width: CGFloat,
-          previous: iTermMalayalamProseParagraph? = nil) {
+          previous: iTermMalayalamProseParagraph? = nil, softOnly: Bool = false) {
         guard rows.count > 1, columns > 0, let first = rows.first,
               let firstLayout = first.layout else { return nil }
-        let firstIndent = first.indent
-        guard firstIndent > 0, let background = first.background,
+        let firstIndent = softOnly ? 0 : first.indent
+        guard softOnly || firstIndent > 0, let background = first.background,
               rows.allSatisfy({ $0.background == background }) else { return nil }
         self.rows = rows
         self.columns = columns
         viewportWidth = width
-        if let previous, previous.matchesGeometryInputs(rows, columns: columns, width: width) {
+        self.softOnly = softOnly
+        if let previous, previous.matchesGeometryInputs(rows, columns: columns, width: width, softOnly: softOnly) {
             indentWidth = previous.indentWidth
             layout = previous.layout
             map = previous.map
@@ -869,7 +1100,8 @@ struct iTermMalayalamProseSpan {
             guard let source = row.layout, source.cellUTF16Boundaries.count == columns + 1 else { return nil }
             let nativeContinuation = index > 0 && rows[index - 1].eol != Int32(EOL_HARD)
             let nextIsNative = index + 1 < rows.count && row.eol != Int32(EOL_HARD)
-            let prefixColumns = nativeContinuation ? 0 : row.indent
+            let prefixColumns = nativeContinuation || softOnly ? 0 :
+                (index == 0 ? row.indent : (row.quotePrefixColumns ?? row.indent))
             let endColumn = nextIsNative ? columns : row.usedColumns
             for column in 0..<columns {
                 let start = source.cellUTF16Boundaries[column].intValue
@@ -1001,24 +1233,37 @@ struct iTermMalayalamProseGroup {
 
 /// Conservative opt-in client prose, never a generic reinterpretation of HARD rows.
 enum iTermMalayalamProseFlow {
+    /// `clientProse` enables the guessed joins of client-painted rows. `softWraps` joins consecutive rows that the
+    /// terminal itself wrapped (SOFT or DWC): that is an explicit continuation, so it needs no indent or guess.
+    /// A run is either all guessed joins or all soft wraps, never both, so each keeps its own meaning.
     static func groups(_ rows: [iTermMalayalamProseSourceRow], columns: Int, width: CGFloat,
-                       clientProse: Bool = false,
+                       clientProse: Bool = false, softWraps: Bool = false,
                        previousParagraphs: [iTermMalayalamProseParagraph] = []) -> [iTermMalayalamProseGroup] {
-        func joins(_ previous: iTermMalayalamProseSourceRow, _ next: iTermMalayalamProseSourceRow) -> Bool {
+        func softJoins(_ previous: iTermMalayalamProseSourceRow, _ next: iTermMalayalamProseSourceRow) -> Bool {
+            // A row without a layout (plain ASCII, unlayable, a table) ends the run.
+            softWraps && next.row == previous.row + 1 &&
+                previous.eol != Int32(EOL_HARD) && previous.layout != nil && next.layout != nil
+        }
+        func joins(_ first: iTermMalayalamProseSourceRow, _ previous: iTermMalayalamProseSourceRow,
+                   _ next: iTermMalayalamProseSourceRow) -> Bool {
             guard clientProse, previous.row + 1 == next.row else { return false }
             let indent = previous.indent
             guard indent > 0, indent == next.indent,
+                  previous.quotePrefixColumns == next.quotePrefixColumns,
+                  !next.hasQuotedLeadingIcon,
                   previous.isPlainProse, next.isPlainProse,
                   let background = previous.background, background == next.background else { return false }
-            // SOFT/DWC is explicit continuation. HARD needs positive evidence of client word wrapping.
-            return previous.eol != Int32(EOL_HARD) ||
+            // A leading quote icon marks one readaloud paragraph, even when logical cells underestimate wrapping.
+            // Unmarked HARD rows still need positive cell-width evidence of client word wrapping.
+            return previous.eol != Int32(EOL_HARD) || first.hasQuotedLeadingIcon ||
                 columns - previous.usedColumns < 1 + next.firstWordCellWidth
         }
         var runs: [[iTermMalayalamProseSourceRow]] = []
+        var softRun: [Bool] = []  // Parallel to runs: the run joined by terminal soft wraps, not by guesses.
         var fence: (marker: Character, length: Int)?
         for row in rows {
-            let text = row.paintedText.trimmingCharacters(in: .whitespacesAndNewlines)
-            if let marker = text.first, marker == "`" || marker == "~" {
+            let text = clientProse ? row.proseText.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+            if clientProse, let marker = text.first, marker == "`" || marker == "~" {
                 let length = text.prefix { $0 == marker }.count
                 if let open = fence {
                     if marker == open.marker && length >= open.length &&
@@ -1026,23 +1271,35 @@ enum iTermMalayalamProseFlow {
                 } else if length >= 3 {
                     fence = (marker, length)
                 }
-                runs.append([row])
+                runs.append([row]); softRun.append(false)
                 continue
             }
-            if fence != nil { runs.append([row]); continue }
-            if let previous = runs.last?.last, joins(previous, row) { runs[runs.count - 1].append(row) }
-            else { runs.append([row]) }
+            if fence != nil { runs.append([row]); softRun.append(false); continue }
+            if let previous = runs.last?.last {
+                let index = runs.count - 1
+                if !softRun[index], joins(runs[index][0], previous, row) {
+                    runs[index].append(row)
+                    continue
+                }
+                if (softRun[index] || runs[index].count == 1), softJoins(previous, row) {
+                    runs[index].append(row)
+                    softRun[index] = true
+                    continue
+                }
+            }
+            runs.append([row]); softRun.append(false)
         }
         var reusable: [ObjectIdentifier: [iTermMalayalamProseParagraph]] = [:]
         for paragraph in previousParagraphs {
             if let first = paragraph.rows.first?.layout { reusable[ObjectIdentifier(first), default: []].append(paragraph) }
         }
-        return runs.map { source in
+        return zip(runs, softRun).map { source, soft in
             let firstLayout = source.first?.layout
             let candidates = firstLayout.flatMap { reusable[ObjectIdentifier($0)] } ?? []
-            let previous = candidates.first { $0.matchesGeometryInputs(source, columns: columns, width: width) }
+            let previous = candidates.first { $0.matchesGeometryInputs(source, columns: columns, width: width, softOnly: soft) }
             return iTermMalayalamProseGroup(rows: source,
-                paragraph: iTermMalayalamProseParagraph(rows: source, columns: columns, width: width, previous: previous))
+                paragraph: iTermMalayalamProseParagraph(rows: source, columns: columns, width: width,
+                                                         previous: previous, softOnly: soft))
         }
     }
 }

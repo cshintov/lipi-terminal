@@ -1419,6 +1419,8 @@ withExtendedAttributes:(iTermExternalAttribute *)ea2 {
             source = ScreenCharToStr(&c) ?: @"";
         }
         BOOL containsHindi = NO;
+        // A non-spacing mark of another script needs a letter in its own cell; a lone mark stays refused.
+        BOOL cellHasLetter = NO;
         UTF32Char previousScalar = 0;
         UTF32Char beforePreviousScalar = 0;
         for (NSUInteger i = 0; i < source.length;) {
@@ -1438,13 +1440,20 @@ withExtendedAttributes:(iTermExternalAttribute *)ea2 {
             const UTF32Char keycapBase = previousScalar == 0xfe0f ? beforePreviousScalar : previousScalar;
             const BOOL keycap = scalar == 0x20e3 &&
                 (keycapBase == '#' || keycapBase == '*' || (keycapBase >= '0' && keycapBase <= '9'));
+            const BOOL otherScript = iTermIsLeftToRightLetterOrMarkCodePoint(scalar) &&
+                (iTermIsCodePointWithOwnCell(scalar) || cellHasLetter);
+            if (otherScript || (scalar >= 'A' && scalar <= 'Z') || (scalar >= 'a' && scalar <= 'z') ||
+                iTermIsNaturalRowCodePoint(scalar, malayalamEnabled, hindiEnabled)) {
+                cellHasLetter = YES;
+            }
             if (iTermIsNaturalRowCodePoint(scalar, malayalamEnabled, hindiEnabled)) {
                 foundNaturalScript = YES;
             } else if ((scalar < 32 || scalar > 126) &&
                        scalar != 0x200c && scalar != 0x200d && !emojiSelector && !keycap &&
                        ![commonCharacters longCharacterIsMember:scalar] &&
+                       !otherScript &&
                        !iTermNaturalRowAccentedLatinCell(source)) {
-                // Keep the existing symbol/punctuation/space policy, not arbitrary supplementary scripts.
+                // Keep the existing symbol/punctuation/space policy, and refuse right-to-left scripts and controls.
                 if (reason) { *reason = @"unsupported-script-or-control"; }
                 return nil;
             }
@@ -1523,9 +1532,15 @@ withExtendedAttributes:(iTermExternalAttribute *)ea2 {
     iTermMalayalamRowLayout *selectionGeometry = nil;
     NSIndexSet *filledSelection = [NSIndexSet indexSet];
     if (selected.count && (foundNaturalScript || allowASCIITable)) {
-        _malayalamRowLayoutBuildCount++;
-        selectionGeometry = [[iTermMalayalamRowLayout alloc] initWithAttributedString:text
-                                                                cellUTF16Boundaries:boundaries];
+        selectionGeometry = previousLayout.selectionBaseline;
+        if (![selectionGeometry.attributedString isEqualToAttributedString:text] ||
+            ![selectionGeometry.cellUTF16Boundaries isEqualToArray:boundaries] ||
+            selectionGeometry.anchorCellWidth != _cellSize.width) {
+            _malayalamRowLayoutBuildCount++;
+            selectionGeometry = [[iTermMalayalamRowLayout alloc] initWithAttributedString:text
+                                                                    cellUTF16Boundaries:boundaries
+                                                                              cellWidth:_cellSize.width];
+        }
         if (!selectionGeometry) {
             if (reason) { *reason = @"selection-geometry"; }
             return nil;
@@ -1572,12 +1587,17 @@ withExtendedAttributes:(iTermExternalAttribute *)ea2 {
     if (!foundNaturalScript && !allowASCIITable) { return nil; }
     iTermMalayalamRowLayout *layout = previousLayout;
     if (![previousLayout.attributedString isEqualToAttributedString:text] ||
-        ![previousLayout.cellUTF16Boundaries isEqualToArray:boundaries]) {
+        ![previousLayout.cellUTF16Boundaries isEqualToArray:boundaries] ||
+        previousLayout.anchorCellWidth != _cellSize.width ||
+        previousLayout.selectionBaseline != selectionGeometry) {
         _malayalamRowLayoutBuildCount++;
         layout = [[iTermMalayalamRowLayout alloc] initWithAttributedString:text
-                                                   cellUTF16Boundaries:boundaries];
+                                                   cellUTF16Boundaries:boundaries
+                                                             cellWidth:_cellSize.width
+                                                     selectionBaseline:selectionGeometry];
     }
-    if (selectionGeometry && (!layout || ![selectionGeometry hasEquivalentGeometryTo:layout])) {
+    // Attaching a baseline validates geometry once; unchanged paint retains that immutable proof.
+    if (selectionGeometry && !layout) {
         if (reason) { *reason = @"selection-shape-changed"; }
         return nil;
     }

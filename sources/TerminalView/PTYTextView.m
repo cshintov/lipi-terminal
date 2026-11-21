@@ -643,7 +643,7 @@ const CGFloat PTYTextViewMarginClickGraceWidth = 2.0;
 
 - (BOOL)scrolledToBottom {
     return (([self visibleRect].origin.y + [self visibleRect].size.height - [self excess]) / _lineHeight ==
-            [_dataSource numberOfLines]);
+            [self malayalamDisplayRowCount]);
 }
 
 - (void)scrollLineUp:(id)sender {
@@ -2614,10 +2614,9 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
                                 previousSourceRowShift:(NSInteger)previousRowShift {
     __block iTermMalayalamDisplayMap *map = nil;
     [_dataSource performBlockWithSavedGrid:^(id<PTYTextViewSynchronousUpdateStateReading> savedState) {
-        // History and the alternate grid share document source rows; embedded surfaces remain unsupported.
+        // History and the grid share document source rows; embedded surfaces remain unsupported.
         if (savedState || ![iTermAdvancedSettingsModel malayalamVisualWrap] ||
             ![iTermAdvancedSettingsModel naturalRows] ||
-            ![_dataSource showingAlternateScreen] ||
             [self hasMarkedText] || _portholes.count || [self hasAnyAnnotations] ||
             self.showTimestamps || _drawingHelper.highlightCursorLine ||
             [_delegate textViewHasBackgroundImage]) {
@@ -2625,22 +2624,55 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
         }
         NSMutableDictionary<NSNumber *, iTermMalayalamRowLayout *> *rows = [NSMutableDictionary dictionary];
         NSMutableDictionary<NSNumber *, iTermMalayalamTableSource *> *tableSources = [NSMutableDictionary dictionary];
-        const BOOL paragraphFlow = [iTermAdvancedSettingsModel malayalamParagraphFlow];
-        NSMutableArray<NSNumber *> *eols = paragraphFlow ? [NSMutableArray array] : nil;
-        NSMutableArray<NSString *> *texts = paragraphFlow ? [NSMutableArray array] : nil;
+        // Every row reports its end of line, because rows the terminal soft-wrapped are joined into one paragraph.
+        // The row text is only filled in for the guessed client-prose policy (the paragraph flow setting).
+        NSMutableArray<NSNumber *> *eols = [NSMutableArray array];
+        NSMutableArray<NSString *> *texts = [NSMutableArray array];
+        NSMutableSet<NSNumber *> *continuations = [NSMutableSet set];
+        const int totalRows = _dataSource.numberOfLines;
+        // Retained history shares exact wrapping and paragraph context with the live grid.
+        // Immutable source layouts and fragments are reused on subsequent refreshes.
+        const int leadingRows = 0;
         [helper beginMalayalamMapPassWithPreviousSourceRowShift:previousRowShift];
         @try {
-            for (int row = 0; row < _dataSource.numberOfLines; row++) {
+            // True while the row above is laid out and the terminal soft-wrapped it onto this row.
+            BOOL wrappedOntoThisRow = NO;
+            const BOOL alternateScreen = [_dataSource showingAlternateScreen];
+            const int historyRows = _dataSource.numberOfScrollbackLines;
+            for (int row = leadingRows; row < totalRows; row++) {
                 BOOL eligible = NO;
                 int eol = EOL_HARD;
                 NSString *sourceText;
-                iTermMalayalamRowLayout *layout = paragraphFlow ?
-                    [helper malayalamLayoutAtLine:row mapEligible:&eligible sourceEol:&eol sourceText:&sourceText] :
-                    [helper malayalamLayoutAtLine:row mapEligible:&eligible];
-                if (paragraphFlow) { [eols addObject:@(eol)]; [texts addObject:sourceText ?: @""]; }
-                if (!eligible) { return; }
+                iTermMalayalamRowLayout *layout = [helper malayalamLayoutAtLine:row mapEligible:&eligible
+                                                                      sourceEol:&eol sourceText:&sourceText];
+                // Unsupported rows, including failed tables, keep one plain grid row.
+                // An unavailable source row still prevents publishing incomplete document geometry.
+                if (!eligible && !helper.malayalamLastRowIsPlain) { return; }
+                iTermMalayalamTableSource *tableSource = helper.malayalamPreparedTableSource;
+                if (!layout && eligible && !helper.malayalamLastRowIsPlain && wrappedOntoThisRow && !tableSource) {
+                    // The rest of a natural-script line that wrapped onto a row of its own (a lone ".", an ASCII
+                    // word) is laid out with that line. A run that starts with ASCII rows is not.
+                    BOOL continuationEligible = NO;
+                    int continuationEol = EOL_HARD;
+                    NSString *continuationText;
+                    iTermMalayalamRowLayout *continued = [helper malayalamContinuationLayoutAtLine:row
+                        mapEligible:&continuationEligible sourceEol:&continuationEol sourceText:&continuationText];
+                    if (continued) {
+                        layout = continued;
+                        eol = continuationEol;
+                        sourceText = continuationText;
+                        [continuations addObject:@(row)];
+                    }
+                }
+                if (alternateScreen && row == historyRows - 1) {
+                    // History ends and the alternate grid begins: no line wraps from one into the other.
+                    eol = EOL_HARD;
+                }
+                [eols addObject:@(eol)];
+                [texts addObject:sourceText ?: @""];
+                wrappedOntoThisRow = layout != nil && eol != EOL_HARD;
                 if (layout) { rows[@(row)] = layout; }
-                if (helper.malayalamPreparedTableSource) { tableSources[@(row)] = helper.malayalamPreparedTableSource; }
+                if (tableSource) { tableSources[@(row)] = tableSource; }
             }
         } @finally {
             [helper endMalayalamMapPass];
@@ -2650,32 +2682,23 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
         iTermMalayalamDisplayMap *previousTableMap = helper.malayalamDisplayMap;
         if (tableSources.count) {
             BOOL matches = [previousTableMap matchesTableSources:tableSources cellWidth:_charWidth] &&
-                (paragraphFlow ? [previousTableMap matchesParagraphRows:rows rowCount:_dataSource.numberOfLines
-                    columns:_dataSource.width width:width sourceEols:eols sourceTexts:texts] :
-                    [previousTableMap matchesRows:rows rowCount:_dataSource.numberOfLines columns:_dataSource.width width:width]);
+                [previousTableMap matchesParagraphRows:rows rowCount:totalRows
+                    columns:_dataSource.width width:width sourceEols:eols sourceTexts:texts leadingRows:leadingRows];
             map = matches ? previousTableMap : [[[iTermMalayalamDisplayMap alloc] initWithRows:rows
-                rowCount:_dataSource.numberOfLines columns:_dataSource.width width:width sourceEols:eols sourceTexts:texts
-                tableSources:tableSources cellWidth:_charWidth previousMap:previousTableMap] autorelease];
+                rowCount:totalRows columns:_dataSource.width width:width sourceEols:eols sourceTexts:texts
+                tableSources:tableSources cellWidth:_charWidth leadingRows:leadingRows
+                continuationRows:continuations previousMap:previousTableMap] autorelease];
             return;
         }
         if (![previousTableMap matchesTableSources:tableSources cellWidth:_charWidth]) { previousTableMap = nil; }
-        if (paragraphFlow) {
-            iTermMalayalamDisplayMap *previous = previousTableMap;
-            if ([previous matchesParagraphRows:rows rowCount:_dataSource.numberOfLines columns:_dataSource.width
-                width:width sourceEols:eols sourceTexts:texts]) {
-                map = previous;
-            } else {
-                map = [[[iTermMalayalamDisplayMap alloc] initWithRows:rows rowCount:_dataSource.numberOfLines
-                    columns:_dataSource.width width:width sourceEols:eols sourceTexts:texts previousMap:previous] autorelease];
-            }
-            return;
-        }
         iTermMalayalamDisplayMap *previous = previousTableMap;
-        if (!previous.paragraphFlowEnabled && [previous matchesRows:rows rowCount:_dataSource.numberOfLines columns:_dataSource.width width:width]) {
+        if ([previous matchesParagraphRows:rows rowCount:totalRows columns:_dataSource.width
+            width:width sourceEols:eols sourceTexts:texts leadingRows:leadingRows]) {
             map = previous;
         } else {
-            map = [[[iTermMalayalamDisplayMap alloc] initWithRows:rows rowCount:_dataSource.numberOfLines
-                columns:_dataSource.width width:width previousMap:previous] autorelease];
+            map = [[[iTermMalayalamDisplayMap alloc] initWithRows:rows rowCount:totalRows
+                columns:_dataSource.width width:width sourceEols:eols sourceTexts:texts leadingRows:leadingRows
+                continuationRows:continuations previousMap:previous] autorelease];
         }
     }];
     return map;
@@ -2883,8 +2906,7 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
         const CGFloat y = NSMinY(self.enclosingScrollView.contentView.bounds);
         const int displayRow = MAX(0, floor(y / oldLineHeight));
         if (_malayalamScrollAnchor.x < 0 || displayRow != _malayalamScrollAnchorDisplayRow) {
-            NSArray<iTermMalayalamDisplayFragment *> *fragments = map.fragments;
-            iTermMalayalamDisplayFragment *fragment = fragments[MIN(displayRow, (int)fragments.count - 1)];
+            iTermMalayalamDisplayFragment *fragment = [map fragmentAtDisplayRow:displayRow];
             NSPoint cell = [fragment sourceCellForLocalColumn:0].pointValue;
             _malayalamScrollAnchor = VT100GridCoordMake(cell.x, cell.y);
         }
@@ -3768,8 +3790,7 @@ static NSString *iTermStringForEventPhase(NSEventPhase eventPhase) {
         anchorRow = _malayalamScrollAnchor.y;
         anchorColumn = _malayalamScrollAnchor.x;
     } else if (hadVisualWrap) {
-        NSArray<iTermMalayalamDisplayFragment *> *fragments = _drawingHelper.malayalamDisplayMap.fragments;
-        iTermMalayalamDisplayFragment *fragment = fragments[MIN(oldDisplayRow, (int)fragments.count - 1)];
+        iTermMalayalamDisplayFragment *fragment = [_drawingHelper.malayalamDisplayMap fragmentAtDisplayRow:oldDisplayRow];
         NSPoint cell = [fragment sourceCellForLocalColumn:0].pointValue;
         anchorRow = cell.y;
         anchorColumn = cell.x;

@@ -39,6 +39,14 @@ NS_INLINE BOOL iTermIsModifierForcingFullWidth(uint32_t cp) {
 // Check if a code point is an RTL-indicating code point.
 BOOL iTermIsRTLCodePoint(uint32_t cp);
 
+// Right-to-left letters, marks and bidi controls, including those in right-to-left script blocks that
+// iTermIsRTLCodePoint does not list (such as Hebrew points and Arabic marks). Natural rows refuse these.
+BOOL iTermIsRightToLeftOrBidiControlCodePoint(uint32_t cp);
+
+// Letters and combining marks (general categories L and M) of any left-to-right script, except the scripts
+// that have their own natural-row setting (Malayalam, Devanagari), invisible selectors and symbol-enclosing marks.
+BOOL iTermIsLeftToRightLetterOrMarkCodePoint(uint32_t cp);
+
 // Check if a code point is in the Malayalam block (U+0D00..U+0D7F).
 // Single source of truth for the range checks that were repeated in the
 // drawing, layout and cell-splitting paths. Callable from Objective-C and

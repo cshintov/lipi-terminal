@@ -1592,6 +1592,37 @@ BOOL iTermIsRTLCodePoint(uint32_t cp) {
     return inRanges(cp, sRTLSupp, sRTLSuppCount);
 }
 
+BOOL iTermIsRightToLeftOrBidiControlCodePoint(uint32_t cp) {
+    if (iTermIsRTLCodePoint(cp)) { return YES; }
+    return (cp >= 0x0590 && cp <= 0x08ff) ||          // Hebrew through Arabic Extended-A
+        cp == 0x200e || cp == 0x200f ||                // LRM, RLM
+        (cp >= 0x202a && cp <= 0x202e) ||              // embeddings and overrides
+        (cp >= 0x2066 && cp <= 0x2069) ||              // isolates
+        (cp >= 0xfb1d && cp <= 0xfdff) ||              // Hebrew and Arabic presentation forms A
+        (cp >= 0xfe70 && cp <= 0xfeff) ||              // Arabic presentation forms B
+        (cp >= 0x10800 && cp <= 0x10fff) ||            // right-to-left historic scripts
+        (cp >= 0x1e800 && cp <= 0x1efff);              // Mende Kikakui, Adlam, Arabic mathematical
+}
+
+BOOL iTermIsLeftToRightLetterOrMarkCodePoint(uint32_t cp) {
+    if (iTermIsRightToLeftOrBidiControlCodePoint(cp)) { return NO; }
+    // Malayalam and Devanagari rows follow their own settings, so the other scripts never admit them.
+    if ((cp >= 0x0900 && cp <= 0x097f) || (cp >= 0x0d00 && cp <= 0x0d7f)) { return NO; }
+    // Invisible and symbol-attached marks are not part of a script's text: the variation selectors, the
+    // combining grapheme joiner, Mongolian free variation selectors, and the marks that enclose symbols.
+    if ((cp >= 0xfe00 && cp <= 0xfe0f) || (cp >= 0xe0100 && cp <= 0xe01ef) || cp == 0x034f ||
+        (cp >= 0x180b && cp <= 0x180f) || (cp >= 0x20d0 && cp <= 0x20ff) || cp == 0x0488 || cp == 0x0489) {
+        return NO;
+    }
+    static NSCharacterSet *lettersAndMarks;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        // Unicode general categories L* and M*.
+        lettersAndMarks = [NSCharacterSet letterCharacterSet];
+    });
+    return [lettersAndMarks longCharacterIsMember:cp];
+}
+
 BOOL iTermIsEmojiModifierBase(uint32_t cp) {
     return inRanges(cp, sEmojiModifierBase, sEmojiModifierBaseCount);
 }

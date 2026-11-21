@@ -2,19 +2,28 @@
 
 <img src="Resources/lipi/logo.png" width="128" height="128" alt="Lipi Terminal logo">
 
-An experimental macOS terminal fork of [iTerm2](https://iterm2.com), focused on
-naturally shaped Malayalam and Hindi text. Core Text supplies shaping; Lipi keeps
-terminal cells and copied source text while projecting text into native glyph
-geometry. It does not squeeze each letter into an equal-width box.
+Lipi Terminal is an experimental [iTerm2](https://iterm2.com) fork for macOS that
+renders Malayalam and Hindi with naturally shaped text.
 
-Lipi is not an official iTerm2 release. Its natural-text options are **off by
-default**. General compatibility, physical-input correctness and acceptable
-performance in every terminal application are not established.
+<!-- Add the approved Malayalam/Hindi demo screenshot here. -->
+
+## Install
+
+1. Download `Lipi-Terminal-macOS-arm64.zip` from
+   [Releases](https://github.com/cshintov/lipi-terminal/releases). The ZIP is for
+   Apple silicon Macs. Compare its SHA-256 with the one in the release notes.
+2. Unzip it and move **Lipi Terminal.app** to Applications. Leave your existing
+   iTerm2 installed.
+3. Lipi is ad hoc signed, not Developer ID signed or notarized. If Finder offers
+   **Open** in the right-click menu, try opening it there. If macOS blocks the
+   first launch, see [Apple's per-app Open Anyway instructions](https://support.apple.com/en-us/102445).
+   Only proceed if you trust the download. Do not turn off Gatekeeper globally.
 
 ## Enable natural text
 
 In **Settings > Advanced**, search for the setting names below. Start a new
-session after changing a natural-row option.
+session after changing a natural-row option. Enable the Malayalam or Hindi
+switch for the script you want; both are off by default.
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
@@ -51,8 +60,10 @@ not establish Codex support.
 
 ## Known limits
 
-- Unsupported row content or screen topology can retain the ordinary grid
-  fallback. Failed table preparation is a separate shared-geometry exception.
+- Unsupported row content or screen layouts may fall back to the ordinary grid.
+- Natural rows can slow down long output and large selections.
+- Pointer movement can sometimes make the view jump when an app requests
+  hover reports. The underlying cause is still under investigation.
 - Paragraph joining is intentionally conservative. It must preserve headings,
   blank lines, list boundaries and original source coordinates.
 - Natural wrapping changes presentation, not the coordinates a terminal client

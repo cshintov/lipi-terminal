@@ -115,12 +115,30 @@ BOOL CheckFindMatchAtIndex(NSData *findMatches, int index) {
 // Structurally eligible nil-layout rows keep one grid fragment; failed table preparation aborts the map.
 @interface iTermMalayalamPreparedRow : NSObject
 @property(nonatomic) BOOL mapEligible;
+// The row itself cannot be laid out (image, bidi, double width, wrong width). It is drawn as a plain row.
+@property(nonatomic) BOOL sourcePlain;
+// Exact content of the row this was prepared from; see -malayalamContentKeyForRow:.
+@property(nonatomic, copy) NSData *contentKey;
 @property(nonatomic) int sourceEol;
 @property(nonatomic, copy) NSString *sourceText;
 @property(nonatomic, strong) iTermMalayalamRowLayout *layout;
 @property(nonatomic, strong) iTermMalayalamTableSource *tableSource;
+@property(nonatomic, copy) NSIndexSet *selectedIndexes;
+@property(nonatomic) BOOL frontTextView;
+@property(nonatomic, copy) NSColor *unfocusedSelectionColor;
+- (BOOL)matchesSelectedIndexes:(NSIndexSet *)selected
+                frontTextView:(BOOL)front
+      unfocusedSelectionColor:(NSColor *)unfocused;
 @end
 @implementation iTermMalayalamPreparedRow
+- (BOOL)matchesSelectedIndexes:(NSIndexSet *)selected
+                frontTextView:(BOOL)front
+      unfocusedSelectionColor:(NSColor *)unfocused {
+    if (![_selectedIndexes isEqualToIndexSet:selected]) { return NO; }
+    if (!selected.count) { return YES; }
+    return _frontTextView == front && (_unfocusedSelectionColor == unfocused ||
+                                     [_unfocusedSelectionColor isEqual:unfocused]);
+}
 @end
 
 @interface iTermTextDrawingHelper() <iTermCursorDelegate, iTermAttributedStringBuilderDelegate>
@@ -163,9 +181,15 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
 @implementation iTermTextDrawingHelper {
     NSMutableDictionary<NSNumber *, iTermMalayalamRowLayout *> *_malayalamRows;
     iTermMalayalamPreparedRow *_malayalamLastPreparedRow;
+    BOOL _malayalamLastRowPlain;
+    NSString *_malayalamLastRefusalReason;
     NSInteger _malayalamPreviousSourceRowShift;
     NSMutableDictionary<NSData *, iTermMalayalamPreparedRow *> *_malayalamSourceRows;
     NSMutableDictionary<NSData *, iTermMalayalamPreparedRow *> *_malayalamNextSourceRows;
+    // The same prepared rows by exact content. They are filled only by a map pass, so they hold at most the rows
+    // of the last pass. A history block that gets a new identity (any append to it) keeps its rows' content.
+    NSMutableDictionary<NSData *, iTermMalayalamPreparedRow *> *_malayalamContentRows;
+    NSMutableDictionary<NSData *, iTermMalayalamPreparedRow *> *_malayalamNextContentRows;
     iTermConfigGenerationTracker *_malayalamConfigTracker;
     uint64_t _malayalamConfigGeneration;
     BOOL _malayalamGenerationTrackingEnabled;
@@ -354,6 +378,14 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
     return NO;
 }
 
+- (BOOL)malayalamLastRowIsPlain {
+    return _malayalamLastRowPlain;
+}
+
+- (NSString *)malayalamLastRefusalReason {
+    return _malayalamLastRefusalReason;
+}
+
 - (iTermMalayalamTableSource *)malayalamPreparedTableSource {
     return _malayalamLastPreparedRow.tableSource;
 }
@@ -368,6 +400,8 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
     // Both positive and negative admission, plus mode-dependent prose/table facts, are stale.
     _malayalamSourceRows = nil;
     _malayalamNextSourceRows = nil;
+    _malayalamContentRows = nil;
+    _malayalamNextContentRows = nil;
     _malayalamLastPreparedRow = nil;
     _malayalamRows = nil;
     _malayalamDisplayMap = nil;
@@ -383,12 +417,15 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
     [self invalidateNaturalRowCachesForModeChange];
     _malayalamPreviousSourceRowShift = MAX(0, shift);
     _malayalamNextSourceRows = [NSMutableDictionary dictionary];
+    _malayalamNextContentRows = [NSMutableDictionary dictionary];
 }
 
 - (void)endMalayalamMapPass {
     _malayalamPreviousSourceRowShift = 0;
     _malayalamSourceRows = _malayalamNextSourceRows;
     _malayalamNextSourceRows = nil;
+    _malayalamContentRows = _malayalamNextContentRows;
+    _malayalamNextContentRows = nil;
 }
 
 - (iTermMalayalamRowLayout *)malayalamLayoutAtLine:(int)line {
@@ -404,32 +441,86 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
     return layout;
 }
 
+// The exact input of a row's preparation: every cell with all its attributes, the width and end of line, the line
+// attribute and bidi mark, and the settings generation. Nil when the content cannot be captured exactly: rows
+// with external attributes (links, underline colors, ...), and once the complex-character registry has reused
+// codes, because a cell then no longer names one string for good.
+- (NSData *)malayalamContentKeyForRow:(ScreenCharArray *)row generation:(uint64_t)generation {
+    if (row.eaIndex && !row.eaIndex.isEmpty) { return nil; }
+    if ([[iTermComplexCharRegistry sharedInstance] hasWrapped]) { return nil; }
+    struct {
+        uint64_t configGeneration;
+        int32_t width;
+        int32_t eol;
+        int32_t lineAttribute;
+        int32_t rtlFound;
+    } header = {
+        generation, row.length, row.eol, (int32_t)row.metadata.lineAttribute, row.metadata.rtlFound ? 1 : 0
+    };
+    NSMutableData *data = [NSMutableData dataWithCapacity:sizeof(header) + row.length * sizeof(screen_char_t)];
+    [data appendBytes:&header length:sizeof(header)];
+    [data appendBytes:row.line length:row.length * sizeof(screen_char_t)];
+    return data;
+}
+
+// A row that the terminal soft-wrapped onto a natural-script row is laid out with it even when it holds no natural
+// script itself (a lone ".", an ASCII word). Its layout is prepared and cached apart from the ordinary layout of
+// the same cells, which is none.
+static const uint64_t iTermMalayalamContinuationKeyBit = 1ULL << 63;
+
+- (iTermMalayalamRowLayout *)malayalamContinuationLayoutAtLine:(int)line mapEligible:(BOOL *)eligible
+                                                      sourceEol:(int *)eol sourceText:(NSString **)sourceText {
+    iTermMalayalamRowLayout *layout = [self malayalamPreparedLayoutAtLine:line mapEligible:eligible continuation:YES];
+    *eol = _malayalamLastPreparedRow.sourceEol;
+    *sourceText = _malayalamLastPreparedRow.sourceText ?: @"";
+    return layout;
+}
+
 - (iTermMalayalamRowLayout *)malayalamLayoutAtLine:(int)line mapEligible:(BOOL *)eligible {
+    iTermMalayalamRowLayout *layout = [self malayalamPreparedLayoutAtLine:line mapEligible:eligible continuation:NO];
+    if (!layout && *eligible && !_malayalamLastRowPlain && !_malayalamNextSourceRows &&
+        [_malayalamDisplayMap isJoinedContinuationRow:line]) {
+        // Drawing, not building the map: the map says this row was joined to the row before it.
+        layout = [self malayalamPreparedLayoutAtLine:line mapEligible:eligible continuation:YES];
+    }
+    return layout;
+}
+
+- (iTermMalayalamRowLayout *)malayalamPreparedLayoutAtLine:(int)line mapEligible:(BOOL *)eligible
+                                              continuation:(BOOL)continuation {
     [self invalidateNaturalRowCachesForModeChange];
     _malayalamLastPreparedRow = nil;
+    _malayalamLastRowPlain = NO;
+    _malayalamLastRefusalReason = nil;
     *eligible = NO;
     if (![iTermAdvancedSettingsModel naturalRows] || line < 0 || line >= _numberOfLines ||
         [self hasMarkedText] || _hasBackgroundImage || _offscreenCommandLine) { return nil; }
     NSData *matches = [_delegate drawingHelperMatchesOnLine:line];
-    NSIndexSet *selected = [_selection selectedIndexesOnAbsoluteLine:line + _totalScrollbackOverflow];
-    // Match Metal's overlay policy: never retain selection/find/hover/annotation paint as a clean baseline.
-    BOOL cacheable = (_malayalamGenerationTrackingEnabled && _fontTable != nil && !selected.count && matches == nil &&
+    NSIndexSet *selected = [_selection selectedIndexesOnAbsoluteLine:line + _totalScrollbackOverflow] ?: [NSIndexSet indexSet];
+    // Simple selection is cached with its exact paint context. Other overlays remain transient.
+    BOOL cacheable = (_malayalamGenerationTrackingEnabled && _fontTable != nil && matches == nil &&
         [self underlinedRangeOnLine:line + _totalScrollbackOverflow].length == 0 &&
         ![_delegate drawingHelperCharactersWithNotesOnLine:line].count && [self canDrawLine:line]);
     iTermRowCacheKey key;
     memset(&key, 0, sizeof(key));
-    key.configGeneration = _malayalamConfigGeneration;
+    key.configGeneration = _malayalamConfigGeneration ^ (continuation ? iTermMalayalamContinuationKeyBit : 0);
     if ([_delegate respondsToSelector:@selector(drawingHelperContentIdentityAtIndex:)]) {
         key.contentIdentity = [_delegate drawingHelperContentIdentityAtIndex:line];
     }
     cacheable &= key.contentIdentity.generation != iTermRowContentGenerationUncacheable;
     NSData *boxedKey = cacheable ? [NSData dataWithBytes:&key length:sizeof(key)] : nil;
     iTermMalayalamPreparedRow *cached = boxedKey ? _malayalamSourceRows[boxedKey] : nil;
+    // Guessed client prose also needs each row's text. A terminal soft wrap needs only the row's end of line.
     BOOL proseMetadata = [iTermAdvancedSettingsModel malayalamParagraphFlow];
-    if (cached && (!proseMetadata || cached.sourceText != nil)) {
+    BOOL eolMetadata = proseMetadata || [iTermAdvancedSettingsModel malayalamVisualWrap];
+    if (cached && (!proseMetadata || cached.sourceText != nil) &&
+        [cached matchesSelectedIndexes:selected frontTextView:_isFrontTextView
+               unfocusedSelectionColor:_unfocusedSelectionColor]) {
         _malayalamLastPreparedRow = cached;
         if (_malayalamNextSourceRows) { _malayalamNextSourceRows[boxedKey] = cached; }
+        if (_malayalamNextContentRows && cached.contentKey) { _malayalamNextContentRows[cached.contentKey] = cached; }
         *eligible = cached.mapEligible;
+        _malayalamLastRowPlain = cached.sourcePlain;
         return cached.layout;
     }
     NS_VALID_UNTIL_END_OF_SCOPE ScreenCharArray *row;
@@ -440,6 +531,27 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
         key.contentIdentity.generation = iTermRowContentGenerationUncacheable;
     }
     if (!row) { return nil; }
+    // A block that was appended to has a new identity for every row it holds, though only its last rows changed.
+    // The same cells under the same settings prepare to the same row, so reuse the earlier preparation.
+    NSData *contentKey = cacheable ? [self malayalamContentKeyForRow:row generation:key.configGeneration] : nil;
+    if (contentKey) {
+        iTermMalayalamPreparedRow *same = _malayalamNextContentRows[contentKey] ?: _malayalamContentRows[contentKey];
+        if (same && (!proseMetadata || same.sourceText != nil) &&
+            [same matchesSelectedIndexes:selected frontTextView:_isFrontTextView
+                 unfocusedSelectionColor:_unfocusedSelectionColor]) {
+            _malayalamLastPreparedRow = same;
+            *eligible = same.mapEligible;
+            _malayalamLastRowPlain = same.sourcePlain;
+            if (key.contentIdentity.generation != iTermRowContentGenerationUncacheable) {
+                boxedKey = [NSData dataWithBytes:&key length:sizeof(key)];
+                if (_malayalamNextSourceRows) {
+                    _malayalamNextSourceRows[boxedKey] = same;
+                    _malayalamNextContentRows[contentKey] = same;
+                }
+            }
+            return same.layout;
+        }
+    }
     BOOL sourceEligible = row.length == _gridSize.width && _gridSize.width > 0 &&
         !row.metadata.rtlFound && row.metadata.lineAttribute == iTermLineAttributeSingleWidth;
     for (int column = 0; sourceEligible && column < row.length; column++) {
@@ -451,14 +563,26 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
     const unichar leading = first < row.length ? row.line[first].code : 0;
     BOOL tableCandidate = sourceEligible && (leading == 0x2502 || leading == 0x250c ||
         leading == 0x251c || leading == 0x2514);
-    iTermMalayalamRowLayout *prepared = (containsMalayalam || tableCandidate) ?
-        [self prepareMalayalamLayoutAtLine:line row:row matches:matches selected:selected allowASCIITable:tableCandidate] : nil;
-    iTermMalayalamRowLayout *layout = containsMalayalam ? prepared : nil;
+    // A continuation row is laid out without natural script of its own, like a table row, but never as a table.
+    // A blank row has nothing to continue the line with.
+    const BOOL asContinuation = continuation && sourceEligible && !containsMalayalam && !tableCandidate &&
+        first < row.length;
+    iTermMalayalamRowLayout *prepared = (containsMalayalam || tableCandidate || asContinuation) ?
+        [self prepareMalayalamLayoutAtLine:line row:row matches:matches selected:selected
+                           allowASCIITable:tableCandidate || asContinuation] : nil;
+    iTermMalayalamRowLayout *layout = (containsMalayalam || asContinuation) ? prepared : nil;
     *eligible = sourceEligible && (!tableCandidate || prepared != nil);
+    // An unsupported table row keeps grid geometry without disabling natural rows elsewhere.
+    _malayalamLastRowPlain = !sourceEligible || (tableCandidate && !prepared);
     iTermMalayalamPreparedRow *record = nil;
-    if (tableCandidate || proseMetadata || (cacheable && key.contentIdentity.generation != iTermRowContentGenerationUncacheable)) {
+    if (tableCandidate || eolMetadata || (cacheable && key.contentIdentity.generation != iTermRowContentGenerationUncacheable)) {
         record = [[iTermMalayalamPreparedRow alloc] init];
         record.mapEligible = *eligible;
+        record.sourcePlain = _malayalamLastRowPlain;
+        record.selectedIndexes = selected;
+        record.frontTextView = _isFrontTextView;
+        record.unfocusedSelectionColor = _unfocusedSelectionColor;
+        record.contentKey = contentKey;
         record.layout = layout;
         if (tableCandidate && prepared) {
             NSMutableIndexSet *padding = [NSMutableIndexSet indexSet];
@@ -480,6 +604,7 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
         boxedKey = [NSData dataWithBytes:&key length:sizeof(key)];
         if (_malayalamNextSourceRows) {
             _malayalamNextSourceRows[boxedKey] = record;
+            if (contentKey && record) { _malayalamNextContentRows[contentKey] = record; }
         } else {
             if (!_malayalamSourceRows || _malayalamSourceRows.count > (NSUInteger)MAX(256, _numberOfLines)) {
                 _malayalamSourceRows = [NSMutableDictionary dictionary];
@@ -514,6 +639,7 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
         backgroundRuns:runs.array findMatches:matches previousLayout:previous
         reason:&reason allowASCIITable:allowASCIITable];
     if (!candidate) {
+        _malayalamLastRefusalReason = [reason copy];
         [_malayalamRows removeObjectForKey:@(line)];
         [self traceMalayalamRow:line layout:nil event:[@"fallback-" stringByAppendingString:reason ?: @"unresolved"]];
         return nil;
@@ -644,8 +770,7 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
 
 - (NSValue *)malayalamCellForX:(CGFloat)x displayRow:(int)row reportingMouseCell:(BOOL)reporting {
     if (!_malayalamDisplayMap) { return nil; }
-    NSArray<iTermMalayalamDisplayFragment *> *pieces = _malayalamDisplayMap.fragments;
-    iTermMalayalamDisplayFragment *fragment = pieces[MAX(0, MIN(row, (int)pieces.count - 1))];
+    iTermMalayalamDisplayFragment *fragment = [_malayalamDisplayMap fragmentAtDisplayRow:MAX(0, row)];
     if (fragment.tableRow) {
         NSInteger sourceRow = fragment.tableRow.sourceRow;
         NSInteger preferred = _malayalamInspectionCell.y == sourceRow + _totalScrollbackOverflow ? _malayalamInspectionCell.x :
@@ -953,18 +1078,31 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
                       fabs(right.nativeEdge.x - left.nativeEdge.x), _cellSize.height);
 }
 
-- (void)drawMalayalamUnderlines:(iTermMalayalamRowLayout *)layout atY:(CGFloat)y
-                      originX:(CGFloat)originX virtualOffset:(CGFloat)virtualOffset {
+// With a segment, only that part of each run is underlined, placed and condensed like its text.
+- (void)drawMalayalamUnderlines:(iTermMalayalamRowLayout *)layout segment:(iTermMalayalamAnchoredSegment *)segment
+                           atY:(CGFloat)y originX:(CGFloat)originX virtualOffset:(CGFloat)virtualOffset {
     for (id object in (__bridge NSArray *)CTLineGetGlyphRuns(layout.line)) {
         CTRunRef run = (__bridge CTRunRef)object;
         NSDictionary *attributes = (__bridge NSDictionary *)CTRunGetAttributes(run);
         if (![attributes[iTermMalayalamUnderlineAttribute] boolValue] || CTRunGetGlyphCount(run) == 0) { continue; }
         CGPoint position;
         CTRunGetPositions(run, CFRangeMake(0, 1), &position);
-        const CGFloat width = CTRunGetTypographicBounds(run, CFRangeMake(0, 0), NULL, NULL, NULL);
+        CGFloat width = CTRunGetTypographicBounds(run, CFRangeMake(0, 0), NULL, NULL, NULL);
         if (width <= 0) { continue; }  // Combining glyphs follow their native base-glyph owner.
-        NSRect rect = NSMakeRect([iTermPreferences sideMargins] + originX + position.x,
-                                 y, width, _cellSize.height * 2);
+        CGFloat scale = 1;
+        CGFloat shift = 0;
+        if (segment) {
+            const CFRange runRange = CTRunGetStringRange(run);
+            const NSRange common = NSIntersectionRange(NSMakeRange(runRange.location, runRange.length), segment.utf16Range);
+            if (!common.length) { continue; }
+            position.x = CTLineGetOffsetForStringIndex(layout.line, common.location, NULL);
+            width = CTLineGetOffsetForStringIndex(layout.line, NSMaxRange(common), NULL) - position.x;
+            if (width <= 0) { continue; }
+            scale = segment.scale;
+            shift = segment.origin - segment.scale * segment.rawStart;
+        }
+        NSRect rect = NSMakeRect([iTermPreferences sideMargins] + originX + shift + scale * position.x,
+                                 y, scale * width, _cellSize.height * 2);
         iTermUnderlineContext storage = { .maskGraphicsContext = nil, .alphaMask = nil };
         [self drawUnderlinedOrStruckthroughTextWithContext:&storage wantUnderline:YES inRect:rect
             underlineColor:[self underlineColorForAttributes:attributes] style:NSUnderlineStyleSingle
@@ -974,8 +1112,8 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
                 CTLineRef maskLine = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)maskText);
                 CGContextSaveGState(ctx);
                 CGContextSetShouldAntialias(ctx, NO);
-                CGContextTranslateCTM(ctx, -position.x - 1, self->_baselineOffset + self->_cellSize.height);
-                CGContextScaleCTM(ctx, 1, -1);
+                CGContextTranslateCTM(ctx, -scale * position.x - 1, self->_baselineOffset + self->_cellSize.height);
+                CGContextScaleCTM(ctx, scale, -1);
                 CGContextSetTextMatrix(ctx, CGAffineTransformIdentity);
                 // The upstream descender mask smears one point around the same glyph geometry.
                 for (int i = 0; i <= 4; i++) {
@@ -993,8 +1131,24 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
     }
 }
 
+// An anchored row is drawn one segment at a time, each placed and condensed by its own anchored geometry.
 - (void)drawMalayalamLayout:(iTermMalayalamRowLayout *)layout sourceLine:(int)line
                        atY:(CGFloat)y originX:(CGFloat)originX context:(CGContextRef)context
+             virtualOffset:(CGFloat)virtualOffset {
+    NSArray<iTermMalayalamAnchoredSegment *> *segments = layout.anchoredGeometry.segments;
+    if (!segments) {
+        [self drawMalayalamLayout:layout segment:nil sourceLine:line atY:y originX:originX
+                          context:context virtualOffset:virtualOffset];
+        return;
+    }
+    for (iTermMalayalamAnchoredSegment *segment in segments) {
+        [self drawMalayalamLayout:layout segment:segment sourceLine:line atY:y originX:originX
+                          context:context virtualOffset:virtualOffset];
+    }
+}
+
+- (void)drawMalayalamLayout:(iTermMalayalamRowLayout *)layout segment:(iTermMalayalamAnchoredSegment *)segment
+                 sourceLine:(int)line atY:(CGFloat)y originX:(CGFloat)originX context:(CGContextRef)context
              virtualOffset:(CGFloat)virtualOffset {
     CGContextSaveGState(context);
     // One shaped mixed row uses its non-ASCII font policy, not a previous row's raster state.
@@ -1008,6 +1162,16 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
     CGContextScaleCTM(context, 1, -1);
     CGContextSetTextMatrix(context, CGAffineTransformIdentity);
     CGContextSetTextPosition(context, 0, 0);
+    if (segment) {
+        // Work in the shaped line's coordinates, clipped to this segment, with the segment's placement.
+        NSArray<iTermMalayalamAnchoredSegment *> *all = layout.anchoredGeometry.segments;
+        const CGFloat open = 1e4;
+        const CGFloat left = segment == all.firstObject ? -open : segment.rawStart;
+        const CGFloat right = segment == all.lastObject ? open : segment.rawEnd;
+        CGContextTranslateCTM(context, segment.origin - segment.scale * segment.rawStart, 0);
+        CGContextScaleCTM(context, segment.scale, 1);
+        CGContextClipToRect(context, CGRectMake(left, -open, right - left, 2 * open));
+    }
     CGContextSaveGState(context);
     CTLineDraw(layout.line, context);
     CGContextRestoreGState(context);
@@ -1036,7 +1200,7 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
     [self traceMalayalamRow:line layout:layout
                      event:syntheticBoldDrawn ? @"CTLineDraw-natural+synthetic-bold" : @"CTLineDraw-natural"];
     CGContextRestoreGState(context);
-    [self drawMalayalamUnderlines:layout atY:y originX:originX virtualOffset:virtualOffset];
+    [self drawMalayalamUnderlines:layout segment:segment atY:y originX:originX virtualOffset:virtualOffset];
 }
 
 - (void)didFinishSetup {
@@ -1095,6 +1259,8 @@ static CGFloat iTermTextDrawingHelperAlphaValueForDefaultBackgroundColor(BOOL ha
         !NSEqualSizes(_cellSize, _malayalamCacheCellSize)) {
         _malayalamSourceRows = nil;
         _malayalamNextSourceRows = nil;
+        _malayalamContentRows = nil;
+        _malayalamNextContentRows = nil;
         _malayalamConfigGeneration = generation;
         _malayalamCacheMinimumContrast = _minimumContrast;
         _malayalamCacheCellSize = _cellSize;

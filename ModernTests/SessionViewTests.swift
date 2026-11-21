@@ -825,7 +825,13 @@ final class MalayalamFooterIntegrationTests: XCTestCase {
                     if activeOverlay {
                         let count = helper.malayalamRowLayoutPreparationCount
                         _ = helper.malayalamLayout(atLine: session.screen.numberOfScrollbackLines())
-                        XCTAssertGreaterThan(helper.malayalamRowLayoutPreparationCount, count, "active overlay bypasses the clean source cache")
+                        if found || hovered {
+                            XCTAssertGreaterThan(helper.malayalamRowLayoutPreparationCount, count,
+                                                 "Find and hover bypass prepared source rows")
+                        } else {
+                            XCTAssertEqual(helper.malayalamRowLayoutPreparationCount, count,
+                                           "unchanged pure selection reuses prepared source rows")
+                        }
                     }
                     try checkCold(session.screen.numberOfScrollbackLines())
                     XCTAssertEqual(session.screen.width(), 110, "viewport projection must not silently change this source-grid fixture")
@@ -1075,6 +1081,75 @@ final class MalayalamFooterIntegrationTests: XCTestCase {
             modifierFlags: [], timestamp: 0, windowNumber: footer.window?.windowNumber ?? 0,
             context: nil, eventNumber: 1, clickCount: 1, pressure: 1))
         footer.mouseDown(with: event)
+    }
+
+    func testNativeHitTestMatchesLinearOracleForExactAndNonexactPositions() throws {
+        let cases: [(String, String, CGFloat)] = [
+            ("Qക്ഷമലയാളംR", "NotoSansMalayalam-Regular", 0),
+            ("कर्म कि क्ष", "DevanagariSangamMN", 0),
+            ("e\u{301} 😀C A\u{200b}B", "Menlo", 0),
+            ("\u{200B}", "Menlo", 0),
+            ("│മലയാളം│कर्म│", "NotoSansMalayalam-Regular", 11)
+        ]
+        for (source, fontName, cellWidth) in cases {
+            let font = try XCTUnwrap(NSFont(name: fontName, size: 20))
+            var boundaries: [NSNumber] = [0]
+            for scalar in source.unicodeScalars {
+                let end = boundaries.last!.intValue + (scalar.value > 0xffff ? 2 : 1)
+                boundaries.append(NSNumber(value: end))
+                if scalar.value > 0xffff { boundaries.append(NSNumber(value: end)) }
+            }
+            let layout = try XCTUnwrap(iTermMalayalamRowLayout(
+                attributedString: NSAttributedString(string: source, attributes: [.font: font]),
+                cellUTF16Boundaries: boundaries, cellWidth: cellWidth))
+            if cellWidth > 0 { XCTAssertNotNil(layout.anchoredGeometry) }
+            // Every scalar boundary is supplied, so projections expose every resolved display boundary.
+            var edges: [Int: iTermMalayalamNativeEdge] = [:]
+            for column in boundaries.indices {
+                let projection = try XCTUnwrap(layout.projection(atColumn: column))
+                if projection.kind == .nativeEdge { edges[projection.utf16Index] = projection.nativeEdge }
+            }
+            let indices = edges.keys.sorted()
+            XCTAssertFalse(indices.isEmpty)
+            func columns(at index: Int) -> [NSNumber] {
+                boundaries.indices.filter { boundaries[$0].intValue == index }.map { NSNumber(value: $0) }
+            }
+            func linear(_ x: CGFloat, reportingASCII: Bool) -> iTermMalayalamRowHit? {
+                guard x.isFinite else { return nil }
+                let text = source as NSString
+                if reportingASCII {
+                    for index in indices where index < text.length {
+                        guard (0x20...0x7e).contains(Int(text.character(at: index))),
+                              let leading = edges[index], let trailing = edges[index + 1],
+                              leading.x < trailing.x, x >= leading.x, x < trailing.x else { continue }
+                        let owned = columns(at: index).filter {
+                            let next = $0.intValue + 1
+                            return next < boundaries.count && boundaries[next].intValue == index + 1
+                        }
+                        if !owned.isEmpty { return iTermMalayalamRowHit(index: index, columns: owned, edge: leading) }
+                    }
+                }
+                var best: iTermMalayalamRowHit?
+                for index in indices {
+                    let edge = edges[index]!
+                    if let previous = best, abs(previous.nativeEdge.x - x) <= abs(edge.x - x) { continue }
+                    best = iTermMalayalamRowHit(index: index, columns: columns(at: index), edge: edge)
+                }
+                return best
+            }
+            let xs = indices.map { edges[$0]!.x }
+            var positions = xs + zip(xs, xs.dropFirst()).map { ($0 + $1) / 2 }
+            positions += [xs.min()! - 100, xs.max()! + 100, 0, -0.0, .nan, .infinity, -.infinity]
+            for reporting in [false, true] {
+                for x in positions {
+                    let expected = linear(x, reportingASCII: reporting)
+                    let actual = layout.hitTest(nativeX: x, reportingASCII: reporting)
+                    XCTAssertEqual(actual?.utf16Index, expected?.utf16Index, "\(source), x=\(x), reporting=\(reporting)")
+                    XCTAssertEqual(actual?.logicalColumns, expected?.logicalColumns)
+                    XCTAssertTrue(actual?.nativeEdge === expected?.nativeEdge)
+                }
+            }
+        }
     }
 
     func testNaturalTextHitUsesClusterEdgesWhileStripSelectsInteriorCell() throws {
@@ -1838,6 +1913,1008 @@ final class MalayalamFooterIntegrationTests: XCTestCase {
         }
     }
 
+    private func settleRefreshCallbacks() {
+        let drained = expectation(description: "refresh callbacks drained")
+        DispatchQueue.main.async { DispatchQueue.main.async { drained.fulfill() } }
+        wait(for: [drained], timeout: 5)
+    }
+
+    func testWrappedBottomClickResumesFollowingAcrossScrollSequences() throws {
+        try withVisualWrap {
+            let (session, view, text, _) = try fixture(initialText: "", scrollbackLines: 80)
+            view.setFrameSize(NSSize(width: 180, height: view.compactFrame().height))
+            let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 180,
+                height: view.compactFrame().height), styleMask: [.titled, .closable],
+                backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            windows.append(window)
+            window.contentView = view
+            window.makeKeyAndOrderFront(nil)
+            XCTAssertTrue(window.makeFirstResponder(text))
+            let scroller = try XCTUnwrap(view.scrollview.verticalScroller as? PTYScroller)
+            let clip = view.scrollview.contentView
+            let line = String(repeating: "മലയാളം ", count: 10)
+            var eventNumber = 2000
+            // Append, inspect history, return to bottom, click. Exercise every three-event sequence.
+            for screen in [false, true] {
+                for sequence in 0..<64 {
+                    feed("\u{1b}[?1049l\u{1b}[3J\u{1b}[2J\u{1b}[H", to: session)
+                    session.clearScrollbackBuffer()
+                    if screen { feed("\u{1b}[?1049h", to: session) }
+                    feed(Array(repeating: line, count: 12).joined(separator: "\r\n"), to: session)
+                    scroller.userScroll = false
+                    _ = text.refresh()
+                    for shift in [0, 2, 4] {
+                        switch (sequence >> shift) & 3 {
+                        case 0:
+                            feed("\r\n" + line, to: session)
+                        case 1:
+                            scroller.userScroll = true
+                            clip.scroll(to: .zero)
+                            view.scrollview.reflectScrolledClipView(clip)
+                        case 2:
+                            scroller.userScroll = true
+                            // Use the actual document extent, independently of the terminal row count.
+                            var bounds = clip.bounds
+                            bounds.origin.y = try XCTUnwrap(view.scrollview.documentView).frame.maxY
+                            clip.scroll(to: clip.constrainBoundsRect(bounds).origin)
+                            view.scrollview.reflectScrolledClipView(clip)
+                            XCTAssertGreaterThanOrEqual(clip.bounds.maxY,
+                                try XCTUnwrap(view.scrollview.documentView).frame.maxY - 1,
+                                "return-to-bottom must really reach the document end")
+                        default:
+                            let atBottom = clip.bounds.maxY >=
+                                (try XCTUnwrap(view.scrollview.documentView).frame.maxY) - 1
+                            XCTAssertEqual(text.scrolledToBottom, atBottom,
+                                "screen=\(screen), sequence=\(sequence), step=\(shift)")
+                            let point = NSPoint(x: 24, y: text.visibleRect.midY)
+                            for kind in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                                let event = try XCTUnwrap(NSEvent.mouseEvent(with: kind,
+                                    location: text.convert(point, to: nil), modifierFlags: [],
+                                    timestamp: Double(eventNumber), windowNumber: window.windowNumber,
+                                    context: nil, eventNumber: eventNumber, clickCount: 1, pressure: 1))
+                                eventNumber += 1
+                                if kind == .leftMouseDown {
+                                    text.mouseDown(with: event)
+                                    // Model a selection lock even when this synthetic window receives first mouse.
+                                    text.lockScroll()
+                                }
+                                else { text.mouseUp(with: event) }
+                            }
+                            XCTAssertEqual(scroller.userScroll, !atBottom,
+                                "bottom=\(atBottom), visible=\(text.visibleRect), frame=\(text.frame), document=\(view.scrollview.documentVisibleRect)")
+                        }
+                        _ = text.refresh()
+                        let map = try XCTUnwrap(text.drawingHelper.malayalamDisplayMap)
+                        XCTAssertGreaterThan(map.displayRowCount, map.sourceRowCount,
+                            "the fixture must expand stored rows into more displayed rows")
+                        if !scroller.userScroll {
+                            let cursor = text.cursorFrame
+                            let viewport = text.textDrawingHelperVisibleRectExcludingTopMargin()
+                            XCTAssertGreaterThanOrEqual(cursor.minY, viewport.minY)
+                            XCTAssertLessThanOrEqual(cursor.maxY, viewport.maxY)
+                        }
+                    }
+                }
+            }
+            XCTAssertTrue(session.writes.isEmpty)
+            settleRefreshCallbacks()
+        }
+    }
+
+    private func withVisualWrap(_ enabled: Bool = true, paragraphFlow: Bool = false,
+                                body: @MainActor () throws -> Void) rethrows {
+        let defaults = iTermUserDefaults.userDefaults()
+        let keys = ["MalayalamVisualWrap", "MalayalamParagraphFlow"]
+        let saved = keys.map { defaults.object(forKey: $0) }
+        defer {
+            for (key, value) in zip(keys, saved) {
+                if let value { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) }
+            }
+            iTermAdvancedSettingsModel.loadAdvancedSettingsFromUserDefaults()
+        }
+        defaults.set(enabled, forKey: keys[0])
+        defaults.set(paragraphFlow, forKey: keys[1])
+        iTermAdvancedSettingsModel.loadAdvancedSettingsFromUserDefaults()
+        try body()
+    }
+
+    /// Checks the whole document geometry of one terminal against the terminal's own rows.
+    private func assertDocumentGeometry(_ session: FooterWriteCapturingSession, _ view: SessionView,
+                                        _ text: PTYTextView, _ trace: String) throws {
+        let helper = try XCTUnwrap(text.drawingHelper)
+        let map = try XCTUnwrap(helper.malayalamDisplayMap, "wrapping is on, so there is a map: \(trace)")
+        // Thousands of rows per test: collect failures and report them once, instead of one XCTAssert per cell.
+        var failures = [String]()
+        func expect(_ condition: Bool, _ message: @autoclosure () -> String) {
+            if !condition && failures.count < 8 { failures.append(message()) }
+        }
+        let screen = session.screen
+        let total = Int(screen.numberOfLines())
+        let alternate = screen.showingAlternateScreen()
+        expect(map.sourceRowCount == total, "source row count \(map.sourceRowCount) != \(total)")
+        // Both screens retain natural geometry for every source row, including the oldest history.
+        expect(map.leadingRows == 0, "leading rows \(map.leadingRows) != 0")
+        let available = view.scrollview.documentVisibleRect.width - 2 * CGFloat(iTermPreferences.sideMargins()) - 2
+        var displayRows = 0
+        var row = 0
+        while row < total {
+            let pieces = map.fragments(forSourceRow: row)
+            expect(!pieces.isEmpty, "row \(row) has no fragment")
+            // (d) display rows increase strictly with source rows, with no gap between neighbours.
+            expect(map.firstDisplayRow(forSourceRow: row) == displayRows, "row \(row) starts at the wrong display row")
+            if let paragraph = pieces.first?.paragraph {
+                // A run of source rows that the terminal wrapped is one paragraph with one set of fragments.
+                let count = paragraph.rows.count
+                let columns = paragraph.columns
+                expect(paragraph.firstSourceRow == row, "paragraph starts at row \(row)")
+                expect(paragraph.rows.map(\.row) == Array(row..<row + count), "paragraph rows are not consecutive at \(row)")
+                for (offset, piece) in pieces.enumerated() {
+                    expect(piece.paragraph === paragraph && piece.displayRow == displayRows + offset,
+                           "row \(row) paragraph fragment numbering")
+                    expect(map.fragment(atDisplayRow: displayRows + offset) === piece, "paragraph fragment at display row, row \(row)")
+                }
+                for member in row..<row + count {
+                    let start = map.firstDisplayRow(forSourceRow: member)
+                    expect(start >= displayRows && start < displayRows + pieces.count, "row \(member) starts outside its paragraph")
+                    expect(map.fragments(forSourceRow: member).first === pieces.first, "row \(member) lost its paragraph")
+                    expect(helper.malayalamLayout(atLine: Int32(member)) != nil, "paragraph row \(member) has no layout")
+                }
+                // (a) the fragments cover the whole paragraph, in order, with no gap and no overlap.
+                let combined = paragraph.layout
+                let text = combined.attributedString.string as NSString
+                let flat = count * columns
+                expect(pieces.first?.firstColumn == 0 && pieces.first?.sourceRange.location == 0,
+                       "paragraph \(row) does not start at column 0")
+                expect(pieces.last?.endColumn == flat && NSMaxRange(pieces.last?.sourceRange ?? NSRange()) == text.length,
+                       "paragraph \(row) does not reach its end")
+                for (left, right) in zip(pieces, pieces.dropFirst()) {
+                    expect(left.endColumn == right.firstColumn && NSMaxRange(left.sourceRange) == right.sourceRange.location,
+                           "paragraph \(row) has a gap or an overlap")
+                }
+                expect(pieces.map { combined.attributedString.attributedSubstring(from: $0.sourceRange).string }.joined() ==
+                       combined.attributedString.string, "paragraph \(row) text is not recovered")
+                // (j) every source cell of the run has exactly one display position, and maps back to itself.
+                var covered: [Int] = []
+                for piece in pieces {
+                    covered += Array(piece.firstColumn..<piece.endColumn)
+                    for column in piece.firstColumn..<piece.endColumn {
+                        let cell = piece.sourceCell(forLocalColumn: column - piece.firstColumn).pointValue
+                        expect(Int(cell.x) == column % columns && Int(cell.y) == paragraph.rows[column / columns].row,
+                               "paragraph \(row) flat column \(column) maps to \(cell)")
+                        let owner = map.fragment(forColumn: column % columns, sourceRow: paragraph.rows[column / columns].row)
+                        expect(owner === piece, "flat column \(column) of paragraph \(row) has another display position")
+                    }
+                }
+                expect(covered == Array(0..<flat), "paragraph \(row) cells are not covered exactly once")
+                for piece in pieces {
+                    // (b) no fragment is wider than the viewport, except one indivisible cluster.
+                    guard let fragmentLayout = piece.layout else { expect(false, "paragraph \(row) fragment lacks a layout"); continue }
+                    let ink = CTLineGetBoundsWithOptions(fragmentLayout.line, .useGlyphPathBounds)
+                    let occupied = piece.originX + max(fragmentLayout.naturalWidth, ink.isNull ? 0 : ink.maxX)
+                    expect(piece.oversizedCluster || occupied <= available + 0.000001,
+                           "paragraph \(row) fragment is \(occupied) wide in \(available)")
+                }
+                // (i) no display row breaks inside a word, unless that one word is wider than the viewport.
+                func space(_ index: Int) -> Bool { index < 0 || index >= text.length || text.character(at: index) == 0x20 }
+                for piece in pieces.dropLast() {
+                    let at = NSMaxRange(piece.sourceRange)
+                    if space(at - 1) || space(at) { continue }
+                    var low = at, high = at
+                    while !space(low - 1) { low -= 1 }
+                    while !space(high) { high += 1 }
+                    let width = CTLineGetOffsetForStringIndex(combined.line, high, nil) -
+                        CTLineGetOffsetForStringIndex(combined.line, low, nil)
+                    expect(width > available, "paragraph \(row) breaks inside a word of width \(width) at \(at)")
+                }
+                displayRows += pieces.count
+                row += count
+                continue
+            }
+            for (offset, piece) in pieces.enumerated() {
+                expect(piece.sourceRow == row && piece.displayRow == displayRows + offset, "row \(row) fragment numbering")
+                expect(map.sourceRow(atDisplayRow: displayRows + offset) == row, "display row to source row, row \(row)")
+                expect(map.fragment(atDisplayRow: displayRows + offset).sourceRow == row, "fragment at display row, row \(row)")
+            }
+            let source = try XCTUnwrap(screen.screenCharArray(forLine: Int32(row)))
+            let layout = helper.malayalamLayout(atLine: Int32(row))
+            let hasMalayalam = source.stringValue.unicodeScalars.contains { (0x0d00..<0x0d80).contains($0.value) }
+            let plainAttribute = source.metadata.lineAttribute.rawValue != 0 // not single width
+            expect((layout != nil) == (hasMalayalam && !plainAttribute), "row \(row) layout presence")
+            // (l) a laid-out row that the terminal soft-wrapped into a single-width row (Malayalam or not) is
+            // joined with it, so no continuation, not even a lone ".", is left on a display row of its own.
+            // History and the alternate grid are separate screens: nothing wraps from one into the other.
+            let seam = alternate && row == Int(screen.numberOfScrollbackLines()) - 1
+            expect(!(row + 1 < total && source.eol != 0 && layout != nil && !seam &&
+                     screen.screenCharArray(forLine: Int32(row + 1)).metadata.lineAttribute.rawValue == 0),
+                   "row \(row) is soft wrapped into row \(row + 1) but was not joined")
+            if let layout, let first = pieces.first, let last = pieces.last {
+                // (a) the fragments cover the whole row, in order, with no gap and no overlap.
+                expect(first.firstColumn == 0 && first.sourceRange.location == 0, "row \(row) does not start at column 0")
+                expect(last.endColumn == layout.cellUTF16Boundaries.count - 1 &&
+                       NSMaxRange(last.sourceRange) == layout.attributedString.length, "row \(row) does not reach its end")
+                for (left, right) in zip(pieces, pieces.dropFirst()) {
+                    expect(left.endColumn == right.firstColumn && NSMaxRange(left.sourceRange) == right.sourceRange.location,
+                           "row \(row) has a gap or an overlap")
+                }
+                expect(pieces.map { layout.attributedString.attributedSubstring(from: $0.sourceRange).string }.joined() ==
+                       layout.attributedString.string, "row \(row) text is not recovered")
+                for piece in pieces {
+                    // (b) no fragment is wider than the viewport, except one indivisible cluster.
+                    guard let fragmentLayout = piece.layout else { expect(false, "row \(row) fragment lacks a layout"); continue }
+                    let ink = CTLineGetBoundsWithOptions(fragmentLayout.line, .useGlyphPathBounds)
+                    let occupied = piece.originX + max(fragmentLayout.naturalWidth, ink.isNull ? 0 : ink.maxX)
+                    expect(piece.oversizedCluster || occupied <= available + 0.000001,
+                           "row \(row) fragment is \(occupied) wide in \(available)")
+                }
+            } else {
+                expect(layout == nil && pieces.count == 1 && pieces[0].layout == nil, "row \(row) must stay one plain row")
+            }
+            displayRows += pieces.count
+            row += 1
+        }
+        // (h) the document height is the sum of the display rows.
+        expect(map.displayRowCount == displayRows, "display row count \(map.displayRowCount) != \(displayRows)")
+        expect(abs((text.desiredHeight - text.excess) - Double(displayRows) * Double(text.lineHeight)) < 0.0001,
+               "document height \(text.desiredHeight - text.excess) != \(displayRows) rows")
+        // (c) the cursor row is inside the document.
+        let cursorRow = Int(screen.numberOfScrollbackLines()) + Int(screen.cursorY()) - 1
+        expect(map.firstDisplayRow(forSourceRow: cursorRow) < displayRows, "cursor row is outside the document")
+        expect(map.fragment(forColumn: Int(screen.cursorX()) - 1, sourceRow: cursorRow) != nil, "no fragment at the cursor")
+        XCTAssertTrue(failures.isEmpty, "\(trace): " + failures.joined(separator: "; "))
+    }
+
+    func testPrimaryScreenWrapCoversWholeDocumentOverEveryShortSequence() throws {
+        let previousBoundary = 300 // Historical cutoff, used only to size the fixture workload.
+        let long = String(repeating: "കേ", count: 39)
+        // 0 append ASCII, 1 append long Malayalam, 2 scroll one row into history, 3 push rows past the former history cutoff,
+        // 4 narrower, 5 wider, 6 clear screen, 7 clear scrollback, 8 enter alternate screen, 9 leave alternate screen,
+        // 10 append a Malayalam line that the terminal soft-wraps into 2 source rows, 11 the same into 3 source rows,
+        // 12 a full 40 cell Malayalam row whose soft-wrapped continuation row is just ".", 13 the same with "abc".
+        let eventNames = ["ascii", "malayalam", "scrollOne", "push", "narrower", "wider", "clearScreen",
+                          "clearScrollback", "enterAlternate", "leaveAlternate", "soft2", "soft3", "dot", "asciiWord"]
+        let softWord = "കവതലമ " // five one-cell letters and a space: 6 cells, so column 40 splits a word
+        let fullRow = String(repeating: softWord, count: 6) + "കവതല" // exactly 40 cells
+        try withVisualWrap {
+            var sequences = 0
+            // One terminal serves a hundred sequences: a new one per sequence is slow, and the cost grows with
+            // the number of terminals made. Each sequence starts from a cleared screen, scrollback, width and
+            // primary screen, and its first check below proves the start state.
+            @MainActor func run(_ events: [Int], in terminal: (FooterWriteCapturingSession, SessionView, PTYTextView)) throws {
+                let (session, view, text) = terminal
+                feed("\u{1b}[?1049l\u{1b}[0m\u{1b}[2J\u{1b}[H", to: session)
+                session.clearScrollbackBuffer()
+                view.setFrameSize(NSSize(width: 640, height: view.frame.height))
+                var counter = 0
+                _ = text.refresh()
+                try assertDocumentGeometry(session, view, text, "start of \(events.map { eventNames[$0] })")
+                for (index, event) in events.enumerated() {
+                    let trace = "sequence \(events.prefix(index + 1).map { eventNames[$0] })"
+                    switch event {
+                    case 0:
+                        feed("ASCII \(counter)\r\n", to: session)
+                    case 1:
+                        feed(long + "\r\n", to: session)
+                    case 2:
+                        let before = session.screen.numberOfScrollbackLines()
+                        var guardCount = 0
+                        while session.screen.numberOfScrollbackLines() == before && guardCount < 20 {
+                            feed("row \(counter)\r\n", to: session)
+                            guardCount += 1
+                        }
+                    case 3:
+                        var lines = ""
+                        for line in 0..<(previousBoundary + 10) { lines += (line % 40 == 0 ? long : "push \(line)") + "\r\n" }
+                        feed(lines, to: session)
+                    case 4:
+                        view.setFrameSize(NSSize(width: 360, height: view.frame.height))
+                    case 5:
+                        view.setFrameSize(NSSize(width: 640, height: view.frame.height))
+                    case 6:
+                        feed("\u{1b}[2J\u{1b}[H", to: session)
+                    case 7:
+                        session.clearScrollbackBuffer()
+                    case 8:
+                        feed("\u{1b}[?1049h", to: session)
+                    case 9:
+                        feed("\u{1b}[?1049l", to: session)
+                    case 10:
+                        feed(String(repeating: softWord, count: 10) + "\r\n", to: session)
+                    case 11:
+                        feed(String(repeating: softWord, count: 15) + "\r\n", to: session)
+                    case 12:
+                        feed(fullRow + ".\r\n", to: session)
+                    default:
+                        feed(fullRow + "abc\r\n", to: session)
+                    }
+                    counter += 1
+                    _ = text.refresh()
+                    try assertDocumentGeometry(session, view, text, trace)
+                    XCTAssertTrue(session.writes.isEmpty, trace)
+                }
+                sequences += 1
+            }
+            @MainActor func every(_ prefix: [Int], depth: Int, in terminal: (FooterWriteCapturingSession, SessionView, PTYTextView)) throws {
+                if depth == 0 { try run(prefix, in: terminal); return }
+                for event in 0..<eventNames.count { try every(prefix + [event], depth: depth - 1, in: terminal) }
+            }
+            // Every sequence of length 3 also checks each of its shorter prefixes after every event.
+            for first in 0..<eventNames.count {
+                let (session, view, text, _) = try fixture(initialText: "", scrollbackLines: 2000)
+                try every([first], depth: 2, in: (session, view, text))
+                settleRefreshCallbacks()
+                sessions.removeAll()
+                parents.removeAll()
+            }
+            XCTAssertEqual(sequences, 2744)
+        }
+    }
+
+    func testTerminalSoftWrappedRowsAreRejoinedAtWordBoundaries() throws {
+        let softWord = "കവതലമ " // 6 cells; the 40 column terminal splits the 7th word in the middle
+        for paragraphFlow in [false, true] {
+            try withVisualWrap(paragraphFlow: paragraphFlow) {
+                let (session, view, text, _) = try fixture(initialText: "", scrollbackLines: 2000)
+                defer { settleRefreshCallbacks() }
+                // Two soft-wrapped rows, a hard break, then three soft-wrapped rows with the cursor on the last
+                // one, like a long prompt line being typed.
+                feed(String(repeating: softWord, count: 10) + "\r\n" + String(repeating: softWord, count: 15), to: session)
+                _ = text.refresh()
+                let helper = try XCTUnwrap(text.drawingHelper)
+                let map = try XCTUnwrap(helper.malayalamDisplayMap)
+                let base = Int(session.screen.numberOfScrollbackLines())
+                let label = "paragraph flow \(paragraphFlow)"
+                let first = try XCTUnwrap(map.fragments(forSourceRow: base).first?.paragraph, label)
+                let second = try XCTUnwrap(map.fragments(forSourceRow: base + 2).first?.paragraph, label)
+                XCTAssertEqual(first.rows.map(\.row), [base, base + 1], label)
+                XCTAssertEqual(second.rows.map(\.row), [base + 2, base + 3, base + 4], label)
+                XCTAssertFalse(first === second, "a hard break ends the run: \(label)")
+                XCTAssertGreaterThan(map.fragments(forSourceRow: base).count, 1, label)
+                // The joined text wraps at word boundaries, so no fragment ends inside a word.
+                let joined = first.layout.attributedString.string as NSString
+                for piece in map.fragments(forSourceRow: base).dropLast() {
+                    let end = NSMaxRange(piece.sourceRange)
+                    XCTAssertTrue(joined.character(at: end - 1) == 0x20 || joined.character(at: end) == 0x20, label)
+                }
+                try assertDocumentGeometry(session, view, text, label)
+                // The cursor is on the last source row of the joined run, on the paragraph's last display row.
+                let cursorRow = base + Int(session.screen.cursorY()) - 1
+                XCTAssertEqual(cursorRow, base + 4, label)
+                let caret = try XCTUnwrap(map.fragment(forColumn: Int(session.screen.cursorX()) - 1, sourceRow: cursorRow), label)
+                XCTAssertTrue(caret.paragraph === second, label)
+                XCTAssertEqual(caret.displayRow, map.firstDisplayRow(forSourceRow: cursorRow + 1) - 1, label)
+                XCTAssertNotNil(helper.malayalamX(forColumn: session.screen.cursorX() - 1, line: Int32(cursorRow)), label)
+                // Selecting across the run still copies the source text, with no inserted newline.
+                text.selection.setSelectedLogicalRange(VT100GridAbsWindowedRangeMake(
+                    VT100GridAbsCoordRangeMake(0, Int64(base + 2), 10, Int64(base + 4)), 0, 0), mode: .kiTermSelectionModeCharacter)
+                XCTAssertEqual(text.selectedText?.trimmingCharacters(in: .whitespaces),
+                               String(repeating: softWord, count: 15).trimmingCharacters(in: .whitespaces), label)
+                text.selection.clear()
+                // Hit-testing reports source cells of the right row, on the display row that was hit.
+                for member in [base, base + 1, base + 2, base + 3, base + 4] {
+                    for column in 0..<40 {
+                        guard let fragment = map.fragment(forColumn: column, sourceRow: member),
+                              let x = helper.malayalamX(forColumn: Int32(column), line: Int32(member))?.doubleValue,
+                              let cell = helper.malayalamCell(forX: CGFloat(x), displayRow: Int32(fragment.displayRow))?.pointValue
+                        else { continue }
+                        let back = try XCTUnwrap(map.fragment(forColumn: Int(cell.x), sourceRow: Int(cell.y)), label)
+                        XCTAssertEqual(back.displayRow, fragment.displayRow, "row \(member) column \(column): \(label)")
+                    }
+                }
+                let image = try XCTUnwrap(text.renderLines(toImage: NSRange(location: base, length: 5)), label)
+                XCTAssertEqual(image.size.height, CGFloat(map.firstDisplayRow(forSourceRow: base + 5) -
+                                                          map.firstDisplayRow(forSourceRow: base)) * text.lineHeight, label)
+            }
+        }
+    }
+
+    func testSoftWrappedMalayalamRowTakesItsAsciiContinuationRow() throws {
+        let fullRow = String(repeating: "കവതലമ ", count: 6) + "കവതല" // exactly 40 cells
+        for paragraphFlow in [false, true] {
+            try withVisualWrap(paragraphFlow: paragraphFlow) {
+                let (session, view, text, _) = try fixture(initialText: "", scrollbackLines: 2000)
+                defer { settleRefreshCallbacks() }
+                // Continuation rows of "." and of an ASCII word, then a line with a space and a dot.
+                feed(fullRow + ".\r\n" + fullRow + "abc\r\n" + fullRow + " .\r\n", to: session)
+                _ = text.refresh()
+                let helper = try XCTUnwrap(text.drawingHelper)
+                let map = try XCTUnwrap(helper.malayalamDisplayMap)
+                // Three lines of two rows each; the cursor is on the row below them.
+                let base = Int(session.screen.numberOfScrollbackLines()) + Int(session.screen.cursorY()) - 1 - 6
+                for (index, tail) in [".", "abc", " ."].enumerated() {
+                    let first = base + 2 * index
+                    let label = "continuation \(tail.debugDescription), paragraph flow \(paragraphFlow)"
+                    XCTAssertNotEqual(session.screen.screenCharArray(forLine: Int32(first)).eol, 0, "fixture: \(label)")
+                    let paragraph = try XCTUnwrap(map.fragments(forSourceRow: first).first?.paragraph, label)
+                    XCTAssertEqual(paragraph.rows.map(\.row), [first, first + 1], label)
+                    XCTAssertTrue(paragraph === map.fragments(forSourceRow: first + 1).first?.paragraph, label)
+                    // The continuation is drawn with its line, not on a display row of its own.
+                    let joined = paragraph.layout.attributedString.string as NSString
+                    XCTAssertTrue(joined.hasSuffix(tail), label)
+                    for piece in map.fragments(forSourceRow: first) {
+                        XCTAssertNotEqual(joined.substring(with: piece.sourceRange).trimmingCharacters(in: .whitespaces),
+                                          tail.trimmingCharacters(in: .whitespaces), label)
+                    }
+                    XCTAssertNotNil(helper.malayalamLayout(atLine: Int32(first + 1)), "the continuation row has a layout to paint: \(label)")
+                }
+                try assertDocumentGeometry(session, view, text, "ascii continuation, paragraph flow \(paragraphFlow)")
+            }
+        }
+    }
+
+    func testSoftWrappedAsciiRunStaysPlainAndOldNaturalParagraphStaysJoined() throws {
+        try withVisualWrap {
+            let (session, view, text, _) = try fixture(initialText: "", scrollbackLines: 2000)
+            defer { settleRefreshCallbacks() }
+            // All-ASCII soft wrap: no layout, so no paragraph and the same single rows as before.
+            feed(String(repeating: "abcdefghi ", count: 12) + "\r\n", to: session)
+            _ = text.refresh()
+            var map = try XCTUnwrap(text.drawingHelper.malayalamDisplayMap)
+            let asciiBase = Int(session.screen.numberOfScrollbackLines())
+            XCTAssertNotEqual(session.screen.screenCharArray(forLine: Int32(asciiBase)).eol, 0, "fixture: ASCII row is soft wrapped")
+            for row in asciiBase..<asciiBase + 3 {
+                XCTAssertEqual(map.fragments(forSourceRow: row).count, 1)
+                XCTAssertNil(map.fragments(forSourceRow: row)[0].layout)
+            }
+            // A soft-wrapped Malayalam row followed by an ASCII-only continuation takes that row into its paragraph.
+            feed(String(repeating: "കവതലമ ", count: 7) + String(repeating: "abcdefghi ", count: 4) + "\r\n", to: session)
+            _ = text.refresh()
+            map = try XCTUnwrap(text.drawingHelper.malayalamDisplayMap)
+            // 42 Malayalam cells and 40 ASCII cells make three source rows: Malayalam, Malayalam plus ASCII, ASCII.
+            let mixed = Int(session.screen.numberOfScrollbackLines()) + Int(session.screen.cursorY()) - 4
+            XCTAssertEqual(session.screen.screenCharArray(forLine: Int32(mixed)).eol, 1)
+            XCTAssertEqual(session.screen.screenCharArray(forLine: Int32(mixed + 1)).eol, 1)
+            XCTAssertEqual(map.fragments(forSourceRow: mixed).first?.paragraph?.rows.map(\.row), [mixed, mixed + 1, mixed + 2])
+            // A run that starts with ASCII-only rows stays as it was: the ASCII head is plain, the run starts at
+            // the first row with natural script.
+            feed(String(repeating: "abcdefghi ", count: 4) + "കവതലമ\r\n", to: session)
+            _ = text.refresh()
+            map = try XCTUnwrap(text.drawingHelper.malayalamDisplayMap)
+            let head = Int(session.screen.numberOfScrollbackLines()) + Int(session.screen.cursorY()) - 3
+            XCTAssertEqual(session.screen.screenCharArray(forLine: Int32(head)).eol, 1)
+            XCTAssertEqual(map.fragments(forSourceRow: head).count, 1, "an ASCII head row stays a plain row")
+            XCTAssertNil(map.fragments(forSourceRow: head)[0].paragraph)
+            XCTAssertNil(map.fragments(forSourceRow: head + 1).first?.paragraph, "a single natural row has nothing to join")
+            // Appending past the former cutoff must not split a retained natural paragraph.
+            let (historySession, historyView, historyText, _) = try fixture(initialText: "", scrollbackLines: 2000)
+            feed(String(repeating: "x\r\n", count: 5), to: historySession)
+            let run = Int(historySession.screen.numberOfScrollbackLines()) + Int(historySession.screen.cursorY()) - 1
+            feed(String(repeating: "കവതലമ ", count: 15) + "\r\n", to: historySession) // 3 source rows
+            feed(String(repeating: "y\r\n", count: 350), to: historySession)
+            _ = historyText.refresh()
+            let historyMap = try XCTUnwrap(historyText.drawingHelper.malayalamDisplayMap)
+            XCTAssertEqual(historyMap.leadingRows, 0)
+            let paragraph = try XCTUnwrap(historyMap.fragments(forSourceRow: run).first?.paragraph)
+            XCTAssertEqual(paragraph.rows.map(\.row), [run, run + 1, run + 2], "the entire retained run stays joined")
+            for row in run..<run + 3 {
+                XCTAssertTrue(historyMap.fragments(forSourceRow: row).first?.paragraph === paragraph)
+            }
+            try assertDocumentGeometry(historySession, historyView, historyText, "old retained soft-wrapped run")
+        }
+    }
+
+    func testStreamingSoftWrappedHistoryReusesPreparedRows() throws {
+        try withVisualWrap {
+            let (session, _, text, _) = try fixture(initialText: "", scrollbackLines: 20000)
+            defer { settleRefreshCallbacks() }
+            let line = String(repeating: "കവതലമ ", count: 15) + "\r\n" // three source rows
+            feed(String(repeating: line, count: 400), to: session)
+            _ = text.refresh()
+            let helper = try XCTUnwrap(text.drawingHelper)
+            // Every append gives the last history block a new identity, but only the new rows changed.
+            var worst: UInt = 0
+            for index in 0..<10 {
+                let before = helper.malayalamRowLayoutPreparationCount
+                feed(line, to: session)
+                _ = text.refresh()
+                worst = max(worst, helper.malayalamRowLayoutPreparationCount - before)
+                XCTAssertNotNil(text.drawingHelper.malayalamDisplayMap, "append \(index)")
+            }
+            XCTAssertLessThanOrEqual(worst, 12, "rows prepared by one refresh after a three-row append")
+            // An idle refresh prepares nothing.
+            let idle = helper.malayalamRowLayoutPreparationCount
+            _ = text.refresh()
+            XCTAssertEqual(helper.malayalamRowLayoutPreparationCount, idle)
+        }
+    }
+
+    func testSelectionBaselineConstructorRejectsDifferentTextAndChains() throws {
+        let font = try XCTUnwrap(NSFont(name: "NotoSansMalayalam-Regular", size: 20))
+        let foreground = NSAttributedString.Key(kCTForegroundColorAttributeName as String)
+        let attributes: [NSAttributedString.Key: Any] = [.font: font, foreground: NSColor.red.cgColor]
+        let source = NSAttributedString(string: "Qക്ഷR", attributes: attributes)
+        let boundaries: [NSNumber] = [0, 1, 3, 4, 5]
+        let baseline = try XCTUnwrap(iTermMalayalamRowLayout(attributedString: source,
+            cellUTF16Boundaries: boundaries, cellWidth: 12))
+        let paint = NSMutableAttributedString(attributedString: source)
+        paint.addAttribute(foreground, value: NSColor.green.cgColor, range: NSRange(location: 1, length: 3))
+        let selected = try XCTUnwrap(iTermMalayalamRowLayout(attributedString: paint,
+            cellUTF16Boundaries: boundaries, cellWidth: 12, selectionBaseline: baseline))
+        XCTAssertTrue(selected.selectionBaseline === baseline)
+        XCTAssertTrue(selected.hasEquivalentGeometry(to: baseline))
+        XCTAssertNil(baseline.selectionBaseline)
+        XCTAssertNil(iTermMalayalamRowLayout(attributedString: NSAttributedString(string: "Qക്ഷS", attributes: attributes),
+            cellUTF16Boundaries: boundaries, cellWidth: 12, selectionBaseline: baseline))
+        XCTAssertNil(iTermMalayalamRowLayout(attributedString: paint, cellUTF16Boundaries: boundaries,
+            cellWidth: 12, selectionBaseline: selected))
+    }
+
+    func testSelectedOldHistoryReusesGeometryAndKeepsCurrentPaint() throws {
+        let defaults = iTermUserDefaults.userDefaults()
+        let copyKeys = ["CopySelection", "CopyLastNewline"]
+        let savedCopy = copyKeys.map { defaults.object(forKey: $0) }
+        for key in copyKeys { defaults.set(false, forKey: key) }
+        defer {
+            settleRefreshCallbacks()
+            for (key, value) in zip(copyKeys, savedCopy) {
+                if let value { defaults.set(value, forKey: key) }
+                else { defaults.removeObject(forKey: key) }
+            }
+        }
+        try withVisualWrap {
+            let (session, view, text, _) = try fixture(initialText: "", scrollbackLines: 2000)
+            var profile = try XCTUnwrap(session.profile)
+            profile[KEY_USE_SELECTED_TEXT_COLOR] = true
+            profile[KEY_USE_SEPARATE_COLORS_FOR_LIGHT_AND_DARK_MODE] = false
+            profile[KEY_MINIMUM_CONTRAST] = 0
+            profile[KEY_CURSOR_BOOST] = 0
+            session.profile = profile
+            session.setPreferencesFromAddressBookEntry(profile)
+            session.setSize(VT100GridSizeMake(110, 6))
+            let literal = "Qക്ഷR " + String(repeating: "മ", count: 90)
+            feed(literal + "\r\n" + String(repeating: "newer output\r\n", count: 350), to: session)
+            let source = session.screen.screenCharArray(forLine: 0).stringValueIncludingEmbeddedNulls
+            let cursor = (session.screen.cursorX(), session.screen.cursorY())
+            XCTAssertEqual(session.screen.screenCharArray(forLine: 0).stringValue, literal)
+            XCTAssertEqual(session.screen.screenCharArray(forLine: 0).eol, Int32(EOL_HARD))
+            XCTAssertGreaterThan(session.screen.numberOfScrollbackLines(), 300)
+            XCTAssertFalse(session.screen.showingAlternateScreen())
+            let scroller = try XCTUnwrap(view.scrollview.verticalScroller as? PTYScroller)
+            scroller.userScroll = true
+            view.scrollview.contentView.scroll(to: .zero)
+            view.scrollview.reflectScrolledClipView(view.scrollview.contentView)
+            let helper = try XCTUnwrap(text.drawingHelper)
+            let highlights = try XCTUnwrap(text.findOnPageHelper.value(forKey: "highlightMap") as? NSMutableDictionary)
+            var whole = true, green = false, large = false, found = false
+            @MainActor func select() {
+                text.selection.clear()
+                text.selection.begin(at: VT100GridAbsCoordMake(1, 0),
+                    mode: .kiTermSelectionModeCharacter, resume: false, append: false)
+                text.selection.moveEndpoint(to: VT100GridAbsCoordMake(whole ? 3 : 2, 0))
+                text.selection.endLive()
+            }
+            @MainActor func colors() {
+                session.screen.performBlock(joinedThreads: { _, state, _ in
+                    state.mutateColorMap { colors in
+                        colors.setColor(.red, forKey: Int32(kColorMapForeground))
+                        colors.setColor(.black, forKey: Int32(kColorMapBackground))
+                        colors.setColor(.black, forKey: Int32(kColorMapSelection))
+                        colors.setColor(green ? .green : .white, forKey: Int32(kColorMapSelectedText))
+                        colors.setColor(.yellow, forKey: Int32(kColorMapMatch))
+                        colors.minimumContrast = 0
+                        colors.dimmingAmount = 0
+                        colors.mutingAmount = 0
+                    }
+                })
+                session.sync()
+            }
+            @MainActor func font() throws {
+                var profile = try XCTUnwrap(session.profile)
+                profile[KEY_NORMAL_FONT] = "Monaco \(large ? 22 : 20)"
+                profile[KEY_NON_ASCII_FONT] = "NotoSansMalayalam-Regular \(large ? 22 : 20)"
+                text.setFontTable(FontTable.fontTable(forProfile: profile), horizontalSpacing: 1, verticalSpacing: 1)
+            }
+            @MainActor func check(_ events: [Int]) throws {
+                _ = text.refresh()
+                let layout = try XCTUnwrap(helper.malayalamLayout(atLine: 0))
+                let currentFont = try XCTUnwrap(layout.attributedString.attribute(.font, at: 1, effectiveRange: nil) as? NSFont)
+                XCTAssertEqual(currentFont.pointSize, large ? 22 : 20, "current font must not reuse stale geometry")
+                XCTAssertGreaterThan(try XCTUnwrap(helper.malayalamDisplayMap).fragments(forSourceRow: 0).count, 1)
+                XCTAssertEqual(text.selectedText, whole ? "ക്ഷ" : "ക്", "\(events)")
+                for (index, color) in [(1, whole ? (green ? NSColor.green : .white) : .red),
+                                       (0, found ? NSColor.black : .red)] {
+                    let actual = try foregroundColor(layout, at: index)
+                    let expected = try XCTUnwrap(color.usingColorSpace(.sRGB))
+                    XCTAssertEqual(actual.redComponent, expected.redComponent, accuracy: 0.001, "\(events)")
+                    XCTAssertEqual(actual.greenComponent, expected.greenComponent, accuracy: 0.001, "\(events)")
+                    XCTAssertEqual(actual.blueComponent, expected.blueComponent, accuracy: 0.001, "\(events)")
+                }
+                let builds = helper.malayalamRowLayoutBuildCount
+                let preparations = helper.malayalamRowLayoutPreparationCount
+                for _ in 0..<2 {
+                    _ = text.refresh()
+                    _ = try XCTUnwrap(helper.malayalamLayout(atLine: 0))
+                    XCTAssertEqual(helper.malayalamRowLayoutBuildCount, builds, "unchanged selected refresh: \(events)")
+                    if !found {
+                        XCTAssertEqual(helper.malayalamRowLayoutPreparationCount, preparations,
+                                       "unchanged pure-selection preparation: \(events)")
+                    }
+                }
+                XCTAssertEqual(session.screen.screenCharArray(forLine: 0).stringValueIncludingEmbeddedNulls, source)
+                XCTAssertEqual(session.screen.screenCharArray(forLine: 0).eol, Int32(EOL_HARD))
+                XCTAssertEqual(session.screen.cursorX(), cursor.0)
+                XCTAssertEqual(session.screen.cursorY(), cursor.1)
+                XCTAssertEqual(session.screen.width(), 110)
+                XCTAssertEqual(session.screen.height(), 6)
+                XCTAssertEqual(session.screen.totalScrollbackOverflow(), 0)
+                XCTAssertTrue(session.writes.isEmpty)
+            }
+            for first in 0..<4 {
+                for second in 0..<4 {
+                    whole = true; green = false; large = false; found = false
+                    highlights.removeAllObjects()
+                    colors(); try font(); select()
+                    try check([])
+                    for event in [first, second] {
+                        switch event {
+                        case 0: whole.toggle(); select()
+                        case 1: green.toggle(); colors()
+                        case 2: large.toggle(); try font()
+                        default:
+                            found.toggle()
+                            if found { highlights[NSNumber(value: 0)] = Data([1]) }
+                            else { highlights.removeAllObjects() }
+                        }
+                        try check([first, second, event])
+                    }
+                }
+            }
+            whole = false
+            select()
+            try check([4]) // Interior selection keeps ordinary paint while retaining its geometry baseline.
+            text.selection.clear()
+            _ = text.refresh()
+            XCTAssertNil(try XCTUnwrap(helper.malayalamLayout(atLine: 0)).selectionBaseline,
+                         "deselection must release the uncolored selection baseline")
+            select()
+            try check([4, 5])
+            XCTAssertNotNil(try XCTUnwrap(helper.malayalamLayout(atLine: 0)).selectionBaseline,
+                            "reselecting an interior cell must retain a baseline despite unchanged foreground")
+        }
+    }
+
+    func testPreparedSelectionContextMatchesColdPaintAcrossShortPairs() throws {
+        let defaults = iTermUserDefaults.userDefaults()
+        let copyKeys = ["CopySelection", "CopyLastNewline"]
+        let savedCopy = copyKeys.map { defaults.object(forKey: $0) }
+        for key in copyKeys { defaults.set(false, forKey: key) }
+        defer {
+            settleRefreshCallbacks()
+            for (key, value) in zip(copyKeys, savedCopy) {
+                if let value { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) }
+            }
+        }
+        try withVisualWrap {
+            let (session, _, text, _) = try fixture(initialText: "", scrollbackLines: 2000)
+            var profile = try XCTUnwrap(session.profile)
+            profile[KEY_USE_SELECTED_TEXT_COLOR] = true
+            profile[KEY_USE_SEPARATE_COLORS_FOR_LIGHT_AND_DARK_MODE] = false
+            profile[KEY_MINIMUM_CONTRAST] = 0.8
+            profile[KEY_CURSOR_BOOST] = 0
+            session.profile = profile
+            session.setPreferencesFromAddressBookEntry(profile)
+            session.setSize(VT100GridSizeMake(110, 6))
+            session.screen.performBlock(joinedThreads: { _, state, _ in
+                state.mutateColorMap { colors in
+                    colors.setColor(NSColor(srgbRed: 0.5, green: 0.5, blue: 0.5, alpha: 1), forKey: Int32(kColorMapForeground))
+                    colors.setColor(NSColor(srgbRed: 0.5, green: 0.5, blue: 0.5, alpha: 1), forKey: Int32(kColorMapSelectedText))
+                    colors.setColor(.black, forKey: Int32(kColorMapBackground))
+                    colors.setColor(.black, forKey: Int32(kColorMapSelection))
+                    colors.minimumContrast = 0.8
+                    colors.dimmingAmount = 0
+                    colors.mutingAmount = 0
+                }
+            })
+            session.sync()
+            feed(String(repeating: "\u{1b}[2mQക്ഷR\u{1b}[0m\r\n", count: 2) +
+                 String(repeating: "tail\r\n", count: 16), to: session)
+            _ = text.refresh()
+            let source = session.screen.screenCharArray(forLine: 0).data
+            XCTAssertEqual(session.screen.screenCharArray(forLine: 1).data, source)
+            let helper = try XCTUnwrap(text.drawingHelper)
+            var selection = 0, front = true, pale = true
+            @MainActor func select() {
+                text.selection.clear()
+                guard selection != 2 else { return }
+                for row in 0..<2 {
+                    text.selection.begin(at: VT100GridAbsCoordMake(1, Int64(row)),
+                        mode: .kiTermSelectionModeCharacter, resume: false, append: row == 1)
+                    let whole = (row == 0) == (selection == 0)
+                    text.selection.moveEndpoint(to: VT100GridAbsCoordMake(whole ? 3 : 2, Int64(row)))
+                    text.selection.endLive()
+                }
+                XCTAssertEqual(text.selection.selectedIndexes(onAbsoluteLine: 0), selection == 0 ? IndexSet(integersIn: 1..<3) : IndexSet(integer: 1))
+                XCTAssertEqual(text.selection.selectedIndexes(onAbsoluteLine: 1), selection == 0 ? IndexSet(integer: 1) : IndexSet(integersIn: 1..<3))
+            }
+            @MainActor func check(_ trace: [Int]) throws -> NSColor {
+                // No refresh after these overrides: direct queries exercise this exact paint configuration.
+                helper.isFrontTextView = front
+                helper.unfocusedSelectionColor = NSColor(srgbRed: pale ? 1 : 0, green: pale ? 1 : 0, blue: pale ? 1 : 0, alpha: 1)
+                helper.minimumContrast = 0.8
+                helper.useSelectedTextColor = true
+                helper.didFinishSetup()
+                helper.beginMalayalamMapPass(withPreviousSourceRowShift: 0)
+                var warm = [iTermMalayalamRowLayout]()
+                do {
+                    for row: Int32 in [0, 1] { warm.append(try XCTUnwrap(helper.malayalamLayout(atLine: row))) }
+                } catch { helper.endMalayalamMapPass(); throw error }
+                helper.endMalayalamMapPass()
+                let cold = try XCTUnwrap(text.perform(NSSelectorFromString("newDrawingHelperForOffscreenRendering"))?
+                    .takeRetainedValue() as? iTermTextDrawingHelper)
+                cold.selection = helper.selection
+                cold.useSelectedTextColor = helper.useSelectedTextColor
+                cold.isFrontTextView = helper.isFrontTextView
+                cold.unfocusedSelectionColor = helper.unfocusedSelectionColor
+                cold.minimumContrast = helper.minimumContrast
+                cold.underlinedRange = helper.underlinedRange
+                cold.didFinishSetup()
+                for row: Int32 in [0, 1] {
+                    let expected = try XCTUnwrap(cold.malayalamLayout(atLine: row))
+                    XCTAssertEqual(warm[Int(row)].attributedString, expected.attributedString, "\(trace), row \(row)")
+                    XCTAssertEqual(warm[Int(row)].cellUTF16Boundaries, expected.cellUTF16Boundaries)
+                    XCTAssertTrue(warm[Int(row)].hasEquivalentGeometry(to: expected))
+                    let repeated = try XCTUnwrap(helper.malayalamLayout(atLine: row))
+                    XCTAssertEqual(repeated.attributedString, expected.attributedString, "unchanged direct query: \(trace)")
+                    XCTAssertEqual(session.screen.screenCharArray(forLine: row).data, source)
+                }
+                XCTAssertTrue(session.writes.isEmpty)
+                return try foregroundColor(warm[0], at: 1)
+            }
+            select()
+            let focused = try check([])
+            front = false
+            let unfocused = try check([1])
+            XCTAssertGreaterThan(abs(focused.redComponent - unfocused.redComponent), 0.1,
+                                 "fixture: focus changes actual contrast-sensitive foreground, not just metadata")
+            for first in 0..<4 {
+                for second in 0..<4 {
+                    selection = 0; front = true; pale = true; select()
+                    _ = try check([])
+                    for event in [first, second] {
+                        switch event {
+                        case 0: selection = (selection + 1) % 3; select()
+                        case 1: front.toggle()
+                        case 2: pale.toggle()
+                        default:
+                            let before = session.screen.contentIdentity(forLine: 0)
+                            feed("tail\r\n", to: session)
+                            _ = text.refresh() // Update source generations before reapplying direct-query configuration.
+                            let after = session.screen.contentIdentity(forLine: 0)
+                            XCTAssertTrue(before.generation != after.generation || before.mutationCount != after.mutationCount)
+                        }
+                        _ = try check([first, second, event])
+                    }
+                }
+            }
+        }
+    }
+
+    // The prepared-row cache may only return what a fresh preparation would draw.
+    func testPreparedRowCacheNeverReturnsADifferentLayoutOverEverySequence() throws {
+        let defaults = iTermUserDefaults.userDefaults()
+        let hindiSaved = defaults.object(forKey: "HindiNaturalRows")
+        defer {
+            if let hindiSaved { defaults.set(hindiSaved, forKey: "HindiNaturalRows") }
+            else { defaults.removeObject(forKey: "HindiNaturalRows") }
+            iTermAdvancedSettingsModel.loadAdvancedSettingsFromUserDefaults()
+        }
+        let softLine = String(repeating: "കവതലമ ", count: 15)
+        let names = ["soft", "ascii", "editRow", "attributes", "hyperlink", "toggleWidth", "paragraphFlow", "hindiMode"]
+        try withVisualWrap {
+            var sequences = 0
+            @MainActor func run(_ events: [Int], in terminal: (FooterWriteCapturingSession, SessionView, PTYTextView)) throws {
+                let (session, view, text) = terminal
+                defaults.set(false, forKey: "MalayalamParagraphFlow")
+                defaults.set(false, forKey: "HindiNaturalRows")
+                iTermAdvancedSettingsModel.loadAdvancedSettingsFromUserDefaults()
+                session.setSize(VT100GridSizeMake(40, 6))
+                feed("\u{1b}[?1049l\u{1b}[0m\u{1b}[2J\u{1b}[H", to: session)
+                session.clearScrollbackBuffer()
+                var flow = false, hindi = false, narrow = false, counter = 0
+                // Warm every cache with a screenful of rows that the events then change around.
+                feed(String(repeating: softLine + "\r\n", count: 8), to: session)
+                _ = text.refresh()
+                for (index, event) in events.enumerated() {
+                    let trace = "sequence \(events.prefix(index + 1).map { names[$0] })"
+                    switch event {
+                    case 0: feed(softLine + "\r\n", to: session)
+                    case 1: feed("ASCII \(counter)\r\n", to: session)
+                    case 2: feed("\u{1b}[3;1Hമലയാളം\(counter)", to: session)
+                    case 3: feed("\u{1b}[4;1H\u{1b}[1;31mകവതലമ\u{1b}[0m", to: session)
+                    case 4: feed("\u{1b}[5;1H\u{1b}]8;;http://example.com\u{1b}\\കവതലമ\u{1b}]8;;\u{1b}\\", to: session)
+                    case 5:
+                        narrow.toggle()
+                        session.setSize(VT100GridSizeMake(narrow ? 30 : 40, 6))
+                    case 6:
+                        flow.toggle()
+                        defaults.set(flow, forKey: "MalayalamParagraphFlow")
+                        iTermAdvancedSettingsModel.loadAdvancedSettingsFromUserDefaults()
+                    default:
+                        hindi.toggle()
+                        defaults.set(hindi, forKey: "HindiNaturalRows")
+                        iTermAdvancedSettingsModel.loadAdvancedSettingsFromUserDefaults()
+                    }
+                    counter += 1
+                    _ = text.refresh()
+                    // Every shorter sequence runs on its own, so only the final state needs the fresh-layout check.
+                    guard index == events.count - 1 else { continue }
+                    let helper = try XCTUnwrap(text.drawingHelper)
+                    let cold = try XCTUnwrap(text.perform(NSSelectorFromString("newDrawingHelperForOffscreenRendering"))?
+                        .takeRetainedValue() as? iTermTextDrawingHelper)
+                    cold.didFinishSetup()
+                    let total = Int32(session.screen.numberOfLines())
+                    var mismatches = [String]()
+                    for row in max(0, total - 16)..<total {
+                        let actual = helper.malayalamLayout(atLine: row)
+                        let expected = cold.malayalamLayout(atLine: row)
+                        if (actual == nil) != (expected == nil) || actual?.attributedString != expected?.attributedString ||
+                            actual?.cellUTF16Boundaries != expected?.cellUTF16Boundaries {
+                            mismatches.append("row \(row)")
+                        }
+                    }
+                    XCTAssertTrue(mismatches.isEmpty, "\(trace): the cached layout differs from a fresh one at \(mismatches.prefix(5))")
+                    XCTAssertTrue(session.writes.isEmpty, trace)
+                }
+                _ = view
+                sequences += 1
+            }
+            @MainActor func every(_ prefix: [Int], depth: Int, in terminal: (FooterWriteCapturingSession, SessionView, PTYTextView)) throws {
+                try run(prefix, in: terminal)
+                if depth == 0 { return }
+                // A fresh reference layout costs most of the time, so length 3 uses the events that change rows,
+                // attributes, width or a setting; every event still takes part in every sequence of length 2.
+                let wide = [0, 2, 3, 4, 5, 6]
+                if prefix.count >= 2 && !prefix.allSatisfy(wide.contains) { return }
+                for event in (prefix.count >= 2 ? wide : Array(0..<names.count)) {
+                    try every(prefix + [event], depth: depth - 1, in: terminal)
+                }
+            }
+            for first in 0..<names.count {
+                let (session, view, text, _) = try fixture(initialText: "", scrollbackLines: 2000)
+                try every([first], depth: 2, in: (session, view, text))
+                settleRefreshCallbacks()
+                sessions.removeAll()
+                parents.removeAll()
+            }
+            XCTAssertEqual(sequences, 8 + 64 + 216) // lengths 1 and 2 over all events, length 3 over six of them
+        }
+    }
+
+    func testSoftWrappedRunsAreUnchangedWithWrapOff() throws {
+        try withVisualWrap(false) {
+            let (session, _, text, _) = try fixture(initialText: "", scrollbackLines: 2000)
+            defer { settleRefreshCallbacks() }
+            feed(String(repeating: "കവതലമ ", count: 15) + "\r\n", to: session)
+            _ = text.refresh()
+            XCTAssertNil(text.drawingHelper.malayalamDisplayMap)
+            XCTAssertEqual(text.desiredHeight - text.excess, Double(session.screen.numberOfLines()) * Double(text.lineHeight), accuracy: 0.0001)
+        }
+    }
+
+    func testPrimaryScreenWrapDrawsAnUnlayableRowAsOnePlainRow() throws {
+        try withVisualWrap {
+            let (session, view, text, _) = try fixture(initialText: "", scrollbackLines: 2000)
+            let long = String(repeating: "കേ", count: 39)
+            // A double-width line cannot be laid out. It sits between wrapped rows and must not end wrapping.
+            feed(long + "\r\n\u{1b}#6wide\r\n" + long + "\r\n", to: session)
+            _ = text.refresh()
+            let map = try XCTUnwrap(text.drawingHelper.malayalamDisplayMap)
+            let base = Int(session.screen.numberOfScrollbackLines())
+            XCTAssertGreaterThan(map.fragments(forSourceRow: base).count, 1)
+            XCTAssertEqual(map.fragments(forSourceRow: base + 1).count, 1)
+            XCTAssertNil(map.fragments(forSourceRow: base + 1)[0].layout)
+            XCTAssertGreaterThan(map.fragments(forSourceRow: base + 2).count, 1)
+            try assertDocumentGeometry(session, view, text, "plain row between wrapped rows")
+        }
+    }
+
+    func testPrimaryScreenWrapSwitchedOffKeepsTheUnwrappedGeometry() throws {
+        let defaults = iTermUserDefaults.userDefaults()
+        let long = String(repeating: "കേ", count: 39)
+        var unwrappedHeight: CGFloat = 0
+        try withVisualWrap(false) {
+            let (session, _, text, _) = try fixture(initialText: "", scrollbackLines: 2000)
+            feed(String(repeating: long + "\r\n", count: 320), to: session)
+            _ = text.refresh()
+            XCTAssertNil(text.drawingHelper.malayalamDisplayMap)
+            unwrappedHeight = text.desiredHeight
+            XCTAssertEqual(unwrappedHeight - text.excess, Double(session.screen.numberOfLines()) * Double(text.lineHeight), accuracy: 0.0001)
+            defaults.set(true, forKey: "MalayalamVisualWrap")
+            iTermAdvancedSettingsModel.loadAdvancedSettingsFromUserDefaults()
+            _ = text.refresh()
+            XCTAssertNotNil(text.drawingHelper.malayalamDisplayMap)
+            XCTAssertGreaterThan(text.desiredHeight, unwrappedHeight)
+            // Natural rows off: no layout, so no map and the unwrapped geometry again.
+            defaults.set(false, forKey: "MalayalamNaturalRows")
+            iTermAdvancedSettingsModel.loadAdvancedSettingsFromUserDefaults()
+            _ = text.refresh()
+            XCTAssertNil(text.drawingHelper.malayalamDisplayMap)
+            XCTAssertEqual(text.desiredHeight, unwrappedHeight)
+            defaults.set(true, forKey: "MalayalamNaturalRows")
+            defaults.set(false, forKey: "MalayalamVisualWrap")
+            iTermAdvancedSettingsModel.loadAdvancedSettingsFromUserDefaults()
+            _ = text.refresh()
+            XCTAssertNil(text.drawingHelper.malayalamDisplayMap)
+            XCTAssertEqual(text.desiredHeight, unwrappedHeight)
+            settleRefreshCallbacks()
+        }
+    }
+
+    func testPrimaryScreenOldHistoryKeepsNaturalWrappingAfterNewOutput() throws {
+        try withVisualWrap {
+            let (session, view, text, _) = try fixture(initialText: "", scrollbackLines: 2000)
+            defer { settleRefreshCallbacks() }
+            feed(String(repeating: "കേ", count: 39) + "\r\n", to: session)
+            _ = text.refresh()
+            let initial = try XCTUnwrap(text.drawingHelper.malayalamDisplayMap)
+            XCTAssertGreaterThan(initial.fragments(forSourceRow: 0).count, 1,
+                                 "fixture: the natural row really exceeds the viewport")
+            let source = try XCTUnwrap(session.screen.screenCharArray(forLine: 0)).stringValue
+            feed(String(repeating: "newer output\r\n", count: 350), to: session)
+            _ = text.refresh()
+            XCTAssertFalse(session.screen.showingAlternateScreen())
+            XCTAssertGreaterThan(session.screen.numberOfLines(), 300)
+            XCTAssertEqual(session.screen.totalScrollbackOverflow(), 0, "the source row was not evicted")
+            let scroller = try XCTUnwrap(view.scrollview.verticalScroller as? PTYScroller)
+            scroller.userScroll = true
+            view.scrollview.contentView.scroll(to: .zero)
+            view.scrollview.reflectScrolledClipView(view.scrollview.contentView)
+            _ = text.refresh()
+            let history = try XCTUnwrap(text.drawingHelper.malayalamDisplayMap)
+            XCTAssertNotNil(history.sourceLayout(forRow: 0), "old retained history must keep its natural layout")
+            XCTAssertGreaterThan(history.fragments(forSourceRow: 0).count, 1,
+                                 "newer output must not turn an older wrapped row into one clipped row")
+            XCTAssertEqual(session.screen.screenCharArray(forLine: 0).stringValue, source)
+            XCTAssertTrue(session.writes.isEmpty)
+        }
+    }
+
+    func testPrimaryScreenHistoryOverflowKeepsTheViewOnItsWrappedSourceRow() throws {
+        try withVisualWrap {
+            // Only 400 rows are kept, so appending drops the oldest rows without flattening retained history.
+            let previousBoundary = 300 // Historical cutoff, used only to verify the fixture reaches older history.
+            let (session, view, text, _) = try fixture(initialText: "", scrollbackLines: 400)
+            defer { settleRefreshCallbacks() }
+            let long = String(repeating: "കേ", count: 39)
+            var lines = ""
+            for line in 0..<390 { lines += (line % 7 == 0 ? long : "line \(line)") + "\r\n" }
+            feed(lines, to: session)
+            _ = text.refresh()
+            let scroller = try XCTUnwrap(view.scrollview.verticalScroller as? PTYScroller)
+            scroller.userScroll = true
+            let clip = view.scrollview.contentView
+            let map = try XCTUnwrap(text.drawingHelper.malayalamDisplayMap)
+            // A middle-history row survives 100 appends, then lies beyond the former 300-row cutoff.
+            let target = try XCTUnwrap((map.sourceRowCount / 3..<map.sourceRowCount).first {
+                map.fragments(forSourceRow: $0).count > 1
+            }, "fixture: a wrapped row that survives the later overflow")
+            clip.scroll(to: NSPoint(x: 0, y: CGFloat(map.firstDisplayRow(forSourceRow: target)) * text.lineHeight))
+            view.scrollview.reflectScrolledClipView(clip)
+            _ = text.refresh()
+            let absoluteTarget = Int64(target) + session.screen.totalScrollbackOverflow()
+            XCTAssertEqual(text.firstVisibleAbsoluteLineNumber, absoluteTarget)
+            var droppedAny = false
+            for step in 0..<20 {
+                feed((0..<5).map { line in (line == 2 ? long : "more \(step) \(line)") + "\r\n" }.joined(), to: session)
+                _ = text.refresh()
+                droppedAny = droppedAny || session.screen.totalScrollbackOverflow() > 0
+                let now = try XCTUnwrap(text.drawingHelper.malayalamDisplayMap)
+                XCTAssertEqual(text.firstVisibleAbsoluteLineNumber, absoluteTarget, "step \(step)")
+                XCTAssertEqual(text.absoluteScrollPosition, absoluteTarget, "step \(step)")
+                let row = Int(absoluteTarget - session.screen.totalScrollbackOverflow())
+                XCTAssertEqual(CGFloat(now.firstDisplayRow(forSourceRow: row)) * text.lineHeight,
+                               clip.bounds.origin.y, accuracy: 0.0001, "step \(step)")
+            }
+            XCTAssertTrue(droppedAny, "fixture must overflow the scrollback limit")
+            let final = try XCTUnwrap(text.drawingHelper.malayalamDisplayMap)
+            let row = Int(absoluteTarget - session.screen.totalScrollbackOverflow())
+            XCTAssertGreaterThanOrEqual(row, 0, "the inspected source row must remain retained")
+            XCTAssertGreaterThan(final.sourceRowCount - row, previousBoundary, "fixture: inspected history is older than the former cutoff")
+            XCTAssertEqual(final.leadingRows, 0)
+            XCTAssertGreaterThan(final.fragments(forSourceRow: row).count, 1, "retained history stays naturally wrapped")
+        }
+    }
+
     func testAlternateScreenVisualWrapAddsPresentationHeightWithoutChangingSource() throws {
         defer {
             // Margin-color updates are queued by refresh. Finish them before releasing their source fixtures.
@@ -1989,6 +3066,9 @@ final class MalayalamFooterIntegrationTests: XCTestCase {
                         CGFloat(map.firstDisplayRow(forSourceRow: 1) - 1) * text.lineHeight)
                     helper.cursorType = originalType
                     helper.cursorCoord = originalCoord
+                } else if enabled {
+                    // Primary screen with wrapping on: it has a map now, and six rows sit inside the window.
+                    XCTAssertEqual(try XCTUnwrap(helper.malayalamDisplayMap, trace).leadingRows, 0, trace)
                 } else {
                     XCTAssertNil(helper.malayalamDisplayMap)
                     XCTAssertEqual(text.desiredHeight, unwrappedHeight, trace)
@@ -2038,7 +3118,8 @@ final class MalayalamFooterIntegrationTests: XCTestCase {
                 case 2:
                     feed("\u{1b}[?1049l", to: session)
                     _ = text.refresh()
-                    XCTAssertNil(text.drawingHelper.malayalamDisplayMap)
+                    // The primary screen now has its own map; its few rows sit inside the primary wrap window.
+                    XCTAssertEqual(try XCTUnwrap(text.drawingHelper.malayalamDisplayMap).leadingRows, 0)
                     feed("\u{1b}[?1049h\u{1b}[2J\u{1b}[H" + sample + "\r\nASCII\u{1b}[6;1H", to: session)
                     gappedStyle = false
                     editedASCII = false
@@ -2385,6 +3466,129 @@ final class MalayalamFooterIntegrationTests: XCTestCase {
         XCTAssertEqual(session.screen.cursorX(), cursor.0)
         XCTAssertEqual(session.screen.cursorY(), cursor.1)
         XCTAssertTrue(session.writes.isEmpty)
+    }
+
+    func testQuotedMalayalamRowsJoinOnlyConservativeContinuations() throws {
+        try withVisualWrap(paragraphFlow: true) {
+            let (session, _, text, _) = try fixture(initialText: "")
+            defer { settleRefreshCallbacks() }
+            session.setSize(VT100GridSizeMake(83, 6))
+            let defaults = iTermUserDefaults.userDefaults()
+            let phrase = "കേരനിരകളാടും ഹരിത"
+            let body = Array(repeating: phrase, count: 6).joined(separator: " ")
+            let firstLiteral = "  ▎ 🔊 " + body
+            let secondLiteral = "  ▎ " + phrase
+            var firstRow: Int32 = 0
+            @MainActor func paint(_ second: String, fenced: Bool = false, quotedFence: Bool = false,
+                                  leadingIcon: Bool = true) {
+                for row in 1...4 { feed("\u{1b}[\(row);1H\u{1b}[2K", to: session) }
+                firstRow = fenced || quotedFence ? 1 : 0
+                let fence = quotedFence ? "  ▎ ```" : "```"
+                if fenced || quotedFence { feed("\u{1b}[1;1H" + fence, to: session) }
+                let quotedFirst = "  \u{1b}[2m▎\u{1b}[0m \u{1b}[3m" +
+                    (leadingIcon ? "🔊 " : "") + body + "\u{1b}[0m"
+                let quotedSecond = second.hasPrefix("  ▎ ") ?
+                    "  \u{1b}[2m▎\u{1b}[0m \u{1b}[3m" + String(second.dropFirst(4)) : second
+                feed("\u{1b}[\(firstRow + 1);1H" + quotedFirst +
+                     "\u{1b}[\(firstRow + 2);1H" + quotedSecond + "\u{1b}[0m", to: session)
+                if fenced || quotedFence { feed("\u{1b}[4;1H" + fence, to: session) }
+            }
+            @MainActor func paragraph() throws -> iTermMalayalamProseParagraph? {
+                _ = text.refresh()
+                let map = try XCTUnwrap(text.drawingHelper.malayalamDisplayMap)
+                return map.fragments(forSourceRow: Int(firstRow)).first?.paragraph
+            }
+            feed("\u{1b}[?1049h", to: session)
+            // Structural boundaries must not become quoted prose just because the row is nearly full.
+            for second in ["", "  ▎ 🔊 " + phrase, "  ▎ # " + phrase, "  ▎ - " + phrase,
+                           "  ▎ ```", "  ▏ " + phrase, "  " + phrase] {
+                paint(second)
+                XCTAssertNil(try paragraph(), "separate boundary: \(second)")
+            }
+            paint(secondLiteral, leadingIcon: false)
+            XCTAssertNil(try paragraph(), "ordinary quotes keep a fitting first word on its own HARD row")
+            let ordinary = try XCTUnwrap(text.drawingHelper.malayalamLayout(atLine: 0))
+            XCTAssertEqual(iTermMalayalamProseSourceRow(row: 0, layout: ordinary,
+                eol: Int32(EOL_HARD)).usedColumns, 75, "eight free cells fit separator plus seven-cell word")
+            paint("  ▎ ടോക്കൺ")
+            XCTAssertNotNil(try paragraph(), "the readaloud marker declares its continuation even at exact fit")
+            let exactFit = try XCTUnwrap(text.drawingHelper.malayalamLayout(atLine: 1))
+            XCTAssertEqual(iTermMalayalamProseSourceRow(row: 1, layout: exactFit,
+                eol: Int32(EOL_HARD)).firstWordCellWidth, 4)
+            XCTAssertEqual(83 - 78, 1 + 4, "actual-wire boundary: five free cells equal separator plus next word")
+            paint(secondLiteral, fenced: true)
+            XCTAssertNil(try paragraph(), "an unquoted code fence still protects quoted-looking contents")
+            paint("  ▎ " + body, quotedFence: true)
+            XCTAssertNil(try paragraph(), "a quoted code fence protects both near-full quoted body rows")
+            paint(secondLiteral)
+            let helper = try XCTUnwrap(text.drawingHelper)
+            let firstLayout = try XCTUnwrap(helper.malayalamLayout(atLine: 0))
+            let secondLayout = try XCTUnwrap(helper.malayalamLayout(atLine: 1))
+            let firstFacts = iTermMalayalamProseSourceRow(row: 0, layout: firstLayout, eol: Int32(EOL_HARD))
+            XCTAssertEqual(firstFacts.usedColumns, 78, "the marked row leaves five source columns")
+            XCTAssertLessThan(83 - firstFacts.usedColumns, 1 + 7, "the next Malayalam word cannot fit")
+            XCTAssertEqual(session.screen.screenCharArray(forLine: 0).stringValue, firstLiteral)
+            XCTAssertEqual(session.screen.screenCharArray(forLine: 1).stringValue, secondLiteral)
+            let sources = (0...1).map { session.screen.screenCharArray(forLine: Int32($0)) }
+            let sourceBytes = sources.map { Data(bytes: $0.line, count: 83 * MemoryLayout<screen_char_t>.stride) }
+            let cursor = (session.screen.cursorX(), session.screen.cursorY())
+            let joined = try XCTUnwrap(try paragraph(), "same quoted HARD rows need one conservative paragraph")
+            XCTAssertEqual(joined.rows.map(\.row), [0, 1])
+            XCTAssertEqual(joined.layout.attributedString.string,
+                           "▎ 🔊 " + Array(repeating: phrase, count: 7).joined(separator: " "))
+            XCTAssertEqual(joined.layout.attributedString.string.filter { $0 == "▎" }.count, 1)
+            XCTAssertEqual(joined.layout.attributedString.string.filter { $0 == "🔊" }.count, 1)
+            XCTAssertEqual(joined.layout.cellUTF16Boundaries.count, 167, "collapsed quote cells retain source addresses")
+            for row in 0...1 {
+                for column in 0...83 {
+                    let cell = iTermMalayalamProseCell(row: row, column: column)
+                    let projected = try XCTUnwrap(joined.projection(cell))
+                    XCTAssertEqual(projected.fragment.firstColumn + projected.caret.logicalColumn, row * 83 + column)
+                }
+            }
+            // Exact source copying keeps the original second quote and HARD newline, not semantic display text.
+            let secondColumns = secondLayout.cellUTF16Boundaries.count - 1
+            let secondEnd = iTermMalayalamProseSourceRow(row: 1, layout: secondLayout,
+                                                       eol: Int32(EOL_HARD)).usedColumns
+            XCTAssertLessThan(secondEnd, secondColumns)
+            text.selection.setSelectedLogicalRange(VT100GridAbsWindowedRangeMake(
+                VT100GridAbsCoordRangeMake(0, 0, Int32(secondEnd), 1), 0, 0), mode: .kiTermSelectionModeCharacter)
+            XCTAssertEqual(text.selectedText, firstLiteral + "\n" + secondLiteral)
+            text.selection.clear()
+            // All ordered pairs of policy and fresh-speaker changes must invalidate stale grouping.
+            for first in 0..<2 {
+                for second in 0..<2 {
+                    var enabled = true
+                    var freshSpeaker = false
+                    defaults.set(true, forKey: "MalayalamParagraphFlow")
+                    iTermAdvancedSettingsModel.loadAdvancedSettingsFromUserDefaults()
+                    paint(secondLiteral)
+                    XCTAssertNotNil(try paragraph())
+                    for event in [first, second] {
+                        if event == 0 { enabled.toggle() } else { freshSpeaker.toggle() }
+                        defaults.set(enabled, forKey: "MalayalamParagraphFlow")
+                        iTermAdvancedSettingsModel.loadAdvancedSettingsFromUserDefaults()
+                        paint(freshSpeaker ? "  ▎ 🔊 " + phrase : secondLiteral)
+                        let current = try paragraph()
+                        XCTAssertEqual(current != nil, enabled && !freshSpeaker, "events \(first),\(second)")
+                    }
+                }
+            }
+            defaults.set(true, forKey: "MalayalamParagraphFlow")
+            iTermAdvancedSettingsModel.loadAdvancedSettingsFromUserDefaults()
+            paint(secondLiteral)
+            XCTAssertNotNil(try paragraph())
+            for row in 0...1 {
+                let source = session.screen.screenCharArray(forLine: Int32(row))
+                XCTAssertEqual(Data(bytes: source.line, count: 83 * MemoryLayout<screen_char_t>.stride), sourceBytes[row])
+                XCTAssertEqual(source.eol, Int32(EOL_HARD))
+            }
+            XCTAssertEqual(session.screen.cursorX(), cursor.0)
+            XCTAssertEqual(session.screen.cursorY(), cursor.1)
+            XCTAssertEqual(session.screen.width(), 83)
+            XCTAssertEqual(session.screen.height(), 6)
+            XCTAssertTrue(session.writes.isEmpty)
+        }
     }
 
     func testSyntheticParagraphsUseSourceCellWordWrapEvidence() throws {
@@ -3542,6 +4746,278 @@ final class MalayalamFooterIntegrationTests: XCTestCase {
         }
     }
 
+    // Natural text, anchored columns: every row built from up to four pieces of a small alphabet.
+    private func anchoredRowFailures(_ row: String, layout: iTermMalayalamRowLayout, helper: iTermTextDrawingHelper,
+                                     line: Int32, columns: Int) -> [String] {
+        let width = helper.cellSize.width
+        let margin = CGFloat(iTermPreferences.sideMargins())
+        let tolerance: CGFloat = 0.000001
+        let text = layout.attributedString.string as NSString
+        let bounds = layout.cellUTF16Boundaries.map(\.intValue)
+        let count = bounds.count - 1
+        let anchors = (0..<count).filter { text.substring(with: NSRange(location: bounds[$0], length: bounds[$0 + 1] - bounds[$0])) == "│" }
+        func x(_ column: Int) -> CGFloat? { layout.projection(atColumn: column)?.nativeEdge?.x }
+        func sameCluster(_ a: Int, _ b: Int) -> Bool {
+            a == b || layout.projection(atColumn: a)?.anchorUTF16Index == layout.projection(atColumn: b)?.anchorUTF16Index
+        }
+        var failures: [String] = []
+        if anchors.isEmpty {
+            let legacy = iTermMalayalamRowLayout(attributedString: layout.attributedString, cellUTF16Boundaries: layout.cellUTF16Boundaries)
+            if layout.anchoredGeometry != nil || legacy?.hasEquivalentGeometry(to: layout) != true ||
+                legacy?.naturalWidth != layout.naturalWidth {
+                failures.append("(vi) row without an anchor changed geometry")
+            }
+            return failures.map { "\(row): \($0)" }
+        }
+        for column in anchors {
+            if let actual = x(column), abs(actual - CGFloat(column) * width) > tolerance {
+                failures.append("(i) anchor \(column) at \(actual), want \(CGFloat(column) * width)")
+            } else if x(column) == nil { failures.append("(i) anchor \(column) has no edge") }
+            if let after = x(column + 1), after < CGFloat(column + 1) * width - tolerance {
+                failures.append("(ii) column \(column + 1) at \(after) before \(CGFloat(column + 1) * width)")
+            }
+            if let reported = helper.malayalamX(forColumn: Int32(column), line: line)?.doubleValue,
+               abs(CGFloat(reported) - (margin + CGFloat(column) * width)) > 0.0001 {
+                failures.append("helper x for anchor \(column) is \(reported)")
+            }
+        }
+        var previous: CGFloat = -.infinity
+        for column in 0...count {
+            guard let value = x(column) else { continue }
+            if value < previous - tolerance { failures.append("(iii) column \(column) at \(value) after \(previous)") }
+            previous = value
+            guard let hit = layout.hitTest(nativeX: value),
+                  hit.logicalColumns.contains(where: { sameCluster($0.intValue, column) }) else {
+                failures.append("(v) hit at column \(column) x \(value) left its cluster"); continue
+            }
+            if let reported = helper.malayalamX(forColumn: Int32(column), line: line)?.doubleValue,
+               abs(CGFloat(reported) - (margin + value)) > 0.0001 {
+                failures.append("helper x for column \(column) is \(reported), want \(margin + value)")
+            }
+            if let hitColumn = helper.malayalamColumnFor(x: margin + value, line: line)?.intValue,
+               !sameCluster(hitColumn, column) {
+                failures.append("helper hit at column \(column) chose \(hitColumn)")
+            }
+        }
+        guard let geometry = layout.anchoredGeometry else { return failures.map { "\(row): \($0)" } + ["\(row): anchored row has no geometry"] }
+        if layout.naturalWidth < CGFloat(anchors.last! + 1) * width - tolerance ||
+            layout.naturalWidth > CGFloat(columns) * width + tolerance {
+            failures.append("row width \(layout.naturalWidth) outside the anchored cells")
+        }
+        let glyphs: [(index: Int, right: CGFloat)] = (CTLineGetGlyphRuns(layout.line) as! [CTRun]).flatMap { run -> [(Int, CGFloat)] in
+            let n = CTRunGetGlyphCount(run)
+            var indices = [CFIndex](repeating: 0, count: n), positions = [CGPoint](repeating: .zero, count: n)
+            var advances = [CGSize](repeating: .zero, count: n)
+            CTRunGetStringIndices(run, CFRange(), &indices)
+            CTRunGetPositions(run, CFRange(), &positions)
+            CTRunGetAdvances(run, CFRange(), &advances)
+            return (0..<n).map { (indices[$0], positions[$0].x + advances[$0].width) }
+        }
+        for segment in geometry.segments where !segment.isAnchor {
+            let limit = anchors.map { CGFloat($0) * width }.first { $0 >= segment.origin + tolerance } ?? CGFloat(columns) * width
+            if segment.scale > 1 { failures.append("(iv) text segment stretched by \(segment.scale)") }
+            if segment.drawnEnd > limit + tolerance { failures.append("(iv) segment ends at \(segment.drawnEnd) past \(limit)") }
+            for glyph in glyphs where NSLocationInRange(glyph.index, segment.utf16Range) {
+                if segment.x(forRaw: glyph.right) > limit + 0.001 { failures.append("(iv) glyph at \(segment.x(forRaw: glyph.right)) past \(limit)") }
+            }
+        }
+        return failures.map { "\(row): \($0)" }
+    }
+
+    // The row-geometry test rewrites the row without refreshing, so it must not see a display map (the primary
+    // screen has one when wrapping is on). The alternate-screen test below needs wrapping.
+    private func anchoredRowFixture(visualWrap: Bool = true) throws -> (FooterWriteCapturingSession, PTYTextView, iTermTextDrawingHelper, Int32) {
+        let defaults = iTermUserDefaults.userDefaults()
+        let saved = ["HindiNaturalRows", "MalayalamVisualWrap", "MalayalamParagraphFlow"].map { ($0, defaults.object(forKey: $0)) }
+        addTeardownBlock {
+            for (key, value) in saved { if let value { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) } }
+        }
+        defaults.set(true, forKey: "HindiNaturalRows")
+        defaults.set(visualWrap, forKey: "MalayalamVisualWrap")
+        defaults.set(false, forKey: "MalayalamParagraphFlow")
+        iTermAdvancedSettingsModel.loadAdvancedSettingsFromUserDefaults()
+        let (session, _, text, _) = try fixture(initialText: "")
+        session.setSize(VT100GridSizeMake(80, 6))
+        _ = text.refresh()
+        return (session, text, try XCTUnwrap(text.drawingHelper), session.screen.numberOfScrollbackLines())
+    }
+
+    func testAnchoredColumnPredicateCoversExactlyTheStructuralBoxCharacters() {
+        let horizontalWords: Set<Substring> = ["LIGHT", "HEAVY", "DOUBLE", "TRIPLE", "QUADRUPLE", "DASH", "HORIZONTAL", "LEFT", "RIGHT", "AND"]
+        for value in UInt32(0x24ff)...0x2580 {
+            let scalar = Unicode.Scalar(value)!
+            let name = scalar.properties.name ?? ""
+            let box = (0x2500...0x257f).contains(value)
+            let pureHorizontal = box && Set(name.dropFirst("BOX DRAWINGS ".count).split(separator: " ")).isSubset(of: horizontalWords)
+            XCTAssertEqual(iTermMalayalamAnchoredGeometry.isAnchor(cell: String(scalar)), box && !pureHorizontal,
+                           "U+\(String(value, radix: 16)) \(name)")
+        }
+        XCTAssertFalse(iTermMalayalamAnchoredGeometry.isAnchor(cell: "│ "))
+        XCTAssertFalse(iTermMalayalamAnchoredGeometry.isAnchor(cell: "a│"))
+        XCTAssertFalse(iTermMalayalamAnchoredGeometry.isAnchor(cell: ""))
+    }
+
+    func testAnchoredColumnsHoldForEveryShortRow() throws {
+        let (session, _, helper, first) = try anchoredRowFixture(visualWrap: false)
+        let pieces = ["word", "അവൻ", "സ്വാതന്ത്ര്യം", "स्वतंत्रता", " ", "│"]
+        var rows: [String] = []
+        var level: [[String]] = [[]]
+        for _ in 1...4 {
+            level = level.flatMap { prefix in pieces.map { prefix + [$0] } }
+            rows += level.map { $0.joined() }
+        }
+        var failures: [String] = [], notAdmitted: [String] = [], natural = 0, anchored = 0
+        for row in rows {
+            feed("\u{1b}[H\u{1b}[2K" + row, to: session)
+            XCTAssertEqual(session.screen.cursorY(), 1, "\(row) must stay on one source row")
+            guard let layout = helper.malayalamLayout(atLine: first) else {
+                if row.unicodeScalars.contains(where: { (0x0900...0x0dff).contains($0.value) }) { notAdmitted.append(row) }
+                continue
+            }
+            natural += 1
+            if layout.anchoredGeometry != nil { anchored += 1 }
+            failures += anchoredRowFailures(row, layout: layout, helper: helper, line: first, columns: 80)
+        }
+        XCTAssertTrue(notAdmitted.isEmpty, "\(notAdmitted.count) rows with script were not admitted, first: \(notAdmitted.prefix(6))")
+        XCTAssertGreaterThan(natural, 1000)
+        XCTAssertGreaterThan(anchored, 500)
+        XCTAssertTrue(failures.isEmpty, "\(failures.count) failures, first: \(failures.prefix(12).joined(separator: "\n"))")
+    }
+
+    // Letters and marks of other left-to-right scripts beside Malayalam are natural rows too.
+    private static let mixedScriptSamples: [(name: String, sample: String)] = [
+        ("cjk", "日本語"), ("kana", "テスト"), ("hiragana", "ひらがな"), ("hangul", "한국어"), ("cyrillic", "Привет"),
+        ("greek", "Ελληνικά"), ("thai", "สวัสดีครับ"), ("tamil", "தமிழ்"), ("latin marks", "naïve cafe\u{301}"),
+    ]
+
+    func testNaturalRowsAdmitLeftToRightScriptsNextToMalayalam() throws {
+        let (session, text, helper, first) = try anchoredRowFixture(visualWrap: false)
+        _ = text
+        let width = Int(session.screen.width())
+        var failures: [String] = []
+        for (name, sample) in Self.mixedScriptSamples {
+            for row in ["\(name): \(sample) മലയാളം", "മലയാളം \(sample)", "\(sample)മലയാളം\(sample)"] {
+                feed("\u{1b}[H\u{1b}[2K" + row, to: session)
+                guard let layout = helper.malayalamLayout(atLine: first) else {
+                    failures.append("\(row): refused, reason \(helper.malayalamLastRefusalReason ?? "none")")
+                    continue
+                }
+                let bounds = layout.cellUTF16Boundaries.map(\.intValue)
+                let length = (layout.attributedString.string as NSString).length
+                if bounds.count != width + 1 { failures.append("\(row): \(bounds.count) boundaries for \(width) cells") }
+                if bounds.first != 0 || bounds.last != length { failures.append("\(row): boundaries do not span the text") }
+                if zip(bounds, bounds.dropFirst()).contains(where: { $0 > $1 }) { failures.append("\(row): boundaries decrease") }
+                // A wide character keeps its two cells: its right half is an empty slice, nothing else is.
+                let source = session.screen.screenCharArray(forLine: first)
+                var contentEnd = Int(source.length)
+                while contentEnd > 0 && source.line[contentEnd - 1].complexChar == 0 && source.line[contentEnd - 1].code == 0 { contentEnd -= 1 }
+                let spacers = (0..<contentEnd).filter { ScreenCharIsDWC_RIGHT(source.line[$0]) }
+                let empty = (0..<contentEnd).filter { bounds[$0] == bounds[$0 + 1] }
+                if spacers != empty { failures.append("\(row): empty cells \(empty) differ from wide spacers \(spacers)") }
+            }
+        }
+        XCTAssertTrue(failures.isEmpty, "\(failures.count) failures: \(failures.prefix(8).joined(separator: "\n"))")
+        // Anchored box borders stay on their own column beside every script.
+        for (name, sample) in Self.mixedScriptSamples {
+            for row in ["│\(sample)│മലയാളം│", "│ മലയാളം │\(sample)│", "\(sample)│മലയാളം│\(sample)"] {
+                feed("\u{1b}[H\u{1b}[2K" + row, to: session)
+                guard let layout = helper.malayalamLayout(atLine: first) else {
+                    failures.append("\(name) \(row): anchored row refused, reason \(helper.malayalamLastRefusalReason ?? "none")")
+                    continue
+                }
+                failures += anchoredRowFailures(row, layout: layout, helper: helper, line: first, columns: width)
+            }
+        }
+        XCTAssertTrue(failures.isEmpty, "\(failures.count) failures: \(failures.prefix(8).joined(separator: "\n"))")
+    }
+
+    func testRightToLeftScriptsAndBidiControlsStayRefusedNextToMalayalam() throws {
+        let (session, _, helper, first) = try anchoredRowFixture(visualWrap: false)
+        let refused: [(String, String)] = [
+            ("hebrew", "שלום"), ("arabic", "مرحبا"), ("syriac", "ܫܠܡܐ"), ("thaana", "ހަބަރު"), ("nko", "ߒߞߏ"),
+            ("samaritan", "ࠀࠁ"), ("hebrew mark", "\u{5b0}"), ("arabic mark", "\u{64b}"),
+            ("rlm", "\u{200f}"), ("lrm", "\u{200e}"), ("rlo", "\u{202e}"), ("rli", "\u{2067}"),
+            ("adlam", "\u{1e900}\u{1e901}"), ("phoenician", "\u{10900}\u{10901}"),
+        ]
+        var failures: [String] = []
+        var reasons = Set<String>()
+        for (name, sample) in refused {
+            for row in ["\(name): \(sample) മലയാളം", "മലയാളം \(sample)"] {
+                feed("\u{1b}[H\u{1b}[2K" + row, to: session)
+                if helper.malayalamLayout(atLine: first) != nil { failures.append("\(row): admitted") }
+                if let reason = helper.malayalamLastRefusalReason { reasons.insert(reason) }
+            }
+        }
+        XCTAssertTrue(failures.isEmpty, "\(failures.count) failures: \(failures.prefix(8).joined(separator: "\n"))")
+        // Where the builder itself refuses (the terminal marks some RTL rows before the builder sees them), the reason is unchanged.
+        XCTAssertTrue(reasons.isSubset(of: ["unsupported-script-or-control"]), "reasons: \(reasons)")
+        // The builder's own predicate, which the terminal's right-to-left marking can shadow in the rows above.
+        for (name, sample) in refused {
+            for scalar in sample.unicodeScalars {
+                XCTAssertTrue(iTermIsRightToLeftOrBidiControlCodePoint(scalar.value), "\(name) U+\(String(scalar.value, radix: 16))")
+                XCTAssertFalse(iTermIsLeftToRightLetterOrMarkCodePoint(scalar.value), "\(name) U+\(String(scalar.value, radix: 16))")
+            }
+        }
+        for (name, sample) in Self.mixedScriptSamples {
+            for scalar in sample.unicodeScalars where scalar != " " {
+                XCTAssertFalse(iTermIsRightToLeftOrBidiControlCodePoint(scalar.value), "\(name) U+\(String(scalar.value, radix: 16))")
+                XCTAssertTrue(iTermIsLeftToRightLetterOrMarkCodePoint(scalar.value), "\(name) U+\(String(scalar.value, radix: 16))")
+            }
+        }
+        for control in [0x07, 0x1b, 0x7f, 0x85, 0x2028, 0x200b] as [UInt32] {
+            XCTAssertFalse(iTermIsLeftToRightLetterOrMarkCodePoint(control), "control or format U+\(String(control, radix: 16))")
+        }
+    }
+
+    func testAnchoredBorderIsDrawnAtItsColumnAndTheAlternateScreenKeepsItOnOneRow() throws {
+        let (session, text, helper, first) = try anchoredRowFixture()
+        let width = helper.cellSize.width
+        func barCenter(_ row: String) throws -> (column: Int, x: CGFloat) {
+            feed("\u{1b}[H\u{1b}[2K" + row, to: session)
+            _ = text.refresh()
+            let layout = helper.malayalamLayout(atLine: first)
+            let bounds = (layout?.cellUTF16Boundaries ?? Array((0...row.count).map { NSNumber(value: $0) })).map(\.intValue)
+            let string = (layout?.attributedString.string ?? row) as NSString
+            let column = try XCTUnwrap((0..<bounds.count - 1).first {
+                string.substring(with: NSRange(location: bounds[$0], length: bounds[$0 + 1] - bounds[$0])) == "│" })
+            let bitmap = try renderedBitmap(text, row: first, name: "anchored-border")
+            let scale = CGFloat(bitmap.pixelsWide) / bitmap.size.width
+            let left = Int((CGFloat(iTermPreferences.sideMargins()) + CGFloat(column) * width) * scale)
+            let right = Int((CGFloat(iTermPreferences.sideMargins()) + CGFloat(column + 1) * width) * scale)
+            var ink = [CGFloat]()
+            for pixel in left..<right {
+                let color = bitmap.colorAt(x: pixel, y: bitmap.pixelsHigh / 2)?.usingColorSpace(.sRGB)
+                if (color?.redComponent ?? 0) > 0.3 { ink.append((CGFloat(pixel) + 0.5) / scale) }
+            }
+            XCTAssertFalse(ink.isEmpty, "\(row) has no border ink in its cell")
+            return (column, ink.reduce(0, +) / CGFloat(max(1, ink.count)))
+        }
+        let control = try barCenter(String(repeating: " ", count: 11) + "│")
+        for row in ["അവൻ അവൻ word │", "സ്വാതന്ത്ര്യം സ്വാതന്ത്ര്യം │", "स्वतंत्रता स्वतंत्रता │"] {
+            let natural = try barCenter(row)
+            let delta = natural.x - CGFloat(natural.column - control.column) * width - control.x
+            XCTAssertEqual(delta, 0, accuracy: 1.5, "\(row) draws its border off its column")
+        }
+        feed("\u{1b}[?1049h\u{1b}[H" + "അവൻ " + String(repeating: "സ്വാതന്ത്ര്യം ", count: 3) + "│ " +
+             String(repeating: "स्वतंत्रता ", count: 4) + "│", to: session)
+        _ = text.refresh()
+        let map = try XCTUnwrap(helper.malayalamDisplayMap)
+        let layout = try XCTUnwrap(helper.malayalamLayout(atLine: first))
+        let pieces = map.fragments(forSourceRow: Int(first))
+        XCTAssertEqual(pieces.count, 1, "an anchored row never wraps")
+        XCTAssertEqual(pieces.first?.originX, 0)
+        XCTAssertTrue(pieces.first?.layout === layout)
+        let bounds = layout.cellUTF16Boundaries.map(\.intValue)
+        let string = layout.attributedString.string as NSString
+        let borders = (0..<bounds.count - 1).filter {
+            string.substring(with: NSRange(location: bounds[$0], length: bounds[$0 + 1] - bounds[$0])) == "│" }
+        XCTAssertEqual(borders.count, 2)
+        for column in borders {
+            let reported = try XCTUnwrap(helper.malayalamX(forColumn: Int32(column), line: first)).doubleValue
+            XCTAssertEqual(CGFloat(reported), CGFloat(iTermPreferences.sideMargins()) + CGFloat(column) * width, accuracy: 0.0001)
+        }
+    }
+
     func testMixedMalayalamEmojiKeepsNaturalHistoryGeometryAndSourceCells() throws {
         let defaults = iTermUserDefaults.userDefaults()
         let settings: [String: Any] = ["MalayalamVisualWrap": true, "MalayalamParagraphFlow": false,
@@ -3646,12 +5122,97 @@ final class MalayalamFooterIntegrationTests: XCTestCase {
             XCTAssertEqual(capacity, 6)
             XCTAssertTrue(session.writes.isEmpty)
         }
-        // Supplementary letters remain outside the admitted common-symbol policy.
+        // A supplementary letter of a left-to-right script is admitted, and a format control is still refused.
         feed("\u{1b}[Hമലയാളം \u{10400}", to: session)
         _ = text.refresh()
-        XCTAssertNotNil(text.drawingHelper.malayalamDisplayMap, "unsupported script is local to its grid row")
+        XCTAssertNotNil(text.drawingHelper.malayalamDisplayMap)
+        XCTAssertNotNil(text.drawingHelper.malayalamLayout(atLine: session.screen.numberOfScrollbackLines()))
+        feed("\u{1b}[Hമലയാളം \u{e000}", to: session) // private use: no script, so still refused
+        _ = text.refresh()
+        XCTAssertNotNil(text.drawingHelper.malayalamDisplayMap, "unsupported text is local to its grid row")
         XCTAssertNil(text.drawingHelper.malayalamLayout(atLine: session.screen.numberOfScrollbackLines()))
         XCTAssertTrue(session.writes.isEmpty)
+    }
+
+    func testFailedBoxedHistoryRowDoesNotDisableOtherNaturalRows() throws {
+        try withVisualWrap {
+            let defaults = iTermUserDefaults.userDefaults()
+            let copyKeys = ["CopySelection", "CopyLastNewline"]
+            let savedCopy = copyKeys.map { defaults.object(forKey: $0) }
+            for key in copyKeys { defaults.set(false, forKey: key) }
+            defer {
+                for (key, value) in zip(copyKeys, savedCopy) {
+                    if let value { defaults.set(value, forKey: key) }
+                    else { defaults.removeObject(forKey: key) }
+                }
+                settleRefreshCallbacks()
+            }
+            let (session, view, text, _) = try fixture(initialText: "", scrollbackLines: 2000)
+            let bad = "│ മലയാളം \u{e000} │"
+            let natural = String(repeating: "കേ", count: 39)
+            feed(bad + "\r\n" + natural + "\r\n", to: session)
+            let originalBad = session.screen.screenCharArray(forLine: 0).data
+            let originalNatural = session.screen.screenCharArray(forLine: 1).data
+            let helper = try XCTUnwrap(text.drawingHelper)
+            for appended in [false, true] {
+                if appended {
+                    feed(String(repeating: "newer output\r\n", count: 350) + natural + "\r\n", to: session)
+                }
+                let cursor = (session.screen.cursorX(), session.screen.cursorY())
+                _ = text.refresh()
+                let prepared = helper.malayalamRowLayoutPreparationCount
+                for cached in [false, true] {
+                    if cached { _ = text.refresh() }
+                    let map = try XCTUnwrap(helper.malayalamDisplayMap,
+                        "failed table must stay local, appended=\(appended), cached=\(cached)")
+                    let plain = try XCTUnwrap(map.fragments(forSourceRow: 0).first)
+                    XCTAssertEqual(map.fragments(forSourceRow: 0).count, 1)
+                    XCTAssertNil(plain.layout)
+                    XCTAssertNil(plain.tableRow)
+                    XCTAssertNil(plain.paragraph)
+                    XCTAssertEqual(plain.firstColumn, 0)
+                    XCTAssertEqual(plain.endColumn, Int(session.screen.width()))
+                    XCTAssertGreaterThan(map.fragments(forSourceRow: 1).count, 1)
+                    if appended {
+                        XCTAssertGreaterThan(map.sourceRowCount, 350)
+                        let newest = Int(session.screen.numberOfScrollbackLines() + session.screen.cursorY() - 2)
+                        XCTAssertGreaterThan(map.fragments(forSourceRow: newest).count, 1)
+                    }
+                    XCTAssertEqual(helper.malayalamRowLayoutPreparationCount, prepared,
+                                   "unchanged refresh must retain the negative prepared-row cache too")
+                }
+                XCTAssertEqual(session.screen.totalScrollbackOverflow(), 0)
+                XCTAssertEqual(session.screen.screenCharArray(forLine: 0).data, originalBad)
+                XCTAssertEqual(session.screen.screenCharArray(forLine: 1).data, originalNatural)
+                XCTAssertEqual(session.screen.cursorX(), cursor.0)
+                XCTAssertEqual(session.screen.cursorY(), cursor.1)
+            }
+            // Read the failed row using the real view's grid fallback, not a natural-layout hit oracle.
+            (view.scrollview.verticalScroller as? PTYScroller)?.userScroll = true
+            view.scrollview.contentView.scroll(to: .zero)
+            view.scrollview.reflectScrolledClipView(view.scrollview.contentView)
+            _ = text.refresh()
+            var point = text.point(for: VT100GridCoordMake(0, 0))
+            point.x += text.charWidth * 0.1
+            point.y += text.lineHeight * 0.5
+            let hit = text.coord(for: point, allowRightMarginOverflow: false)
+            XCTAssertEqual(hit.x, 0)
+            XCTAssertEqual(hit.y, 0)
+            for (end, expected) in [(Int32(1), "│"), (session.screen.width(), bad)] {
+                text.selection.setSelectedLogicalRange(VT100GridAbsWindowedRangeMake(
+                    VT100GridAbsCoordRangeMake(0, 0, end, 0), 0, 0), mode: .kiTermSelectionModeCharacter)
+                XCTAssertEqual(text.selectedText, expected)
+                text.selection.clear()
+            }
+            session.clearScrollbackBuffer()
+            _ = text.refresh()
+            XCTAssertEqual(session.screen.numberOfScrollbackLines(), 0)
+            let recovered = try XCTUnwrap(helper.malayalamDisplayMap)
+            let liveNatural = Int(session.screen.cursorY()) - 2
+            XCTAssertEqual(session.screen.screenCharArray(forLine: Int32(liveNatural)).stringValue, natural)
+            XCTAssertGreaterThan(recovered.fragments(forSourceRow: liveNatural).count, 1)
+            XCTAssertTrue(session.writes.isEmpty)
+        }
     }
 
     func testUnsupportedRowsKeepNeighboringMalayalamWrapped() throws {
@@ -3697,7 +5258,7 @@ final class MalayalamFooterIntegrationTests: XCTestCase {
                     if event == 1 { narrow.toggle() }
                     if event == 2 { scrolled.toggle() }
                     view.setFrameSize(NSSize(width: narrow ? 260 : 400, height: height))
-                    let middle = "ROW മലയാളം" + (kind == 2 ? " \u{10400}" : "")
+                    let middle = "ROW മലയാളം" + (kind == 2 ? " \u{e000}" : "")
                     feed("\u{1b}[0m\u{1b}[H\u{1b}[2J" + prose + "\u{1b}[2;1H" +
                          (kind == 1 ? "\u{1b}[5m" : "") + middle + "\u{1b}[0m\u{1b}[3;1H" + prose + "\u{1b}[6;1H", to: session)
                     let base = session.screen.numberOfScrollbackLines()
@@ -3745,9 +5306,16 @@ final class MalayalamFooterIntegrationTests: XCTestCase {
                 XCTAssertNil(helper.malayalamLayout(atLine: session.screen.numberOfScrollbackLines() + 1))
                 XCTAssertNotNil(helper.malayalamDisplayMap)
             }
-            feed("\u{1b}[2;1H\u{1b}[2K│ മലയാളം \u{10400} │", to: session)
+            feed("\u{1b}[2;1H\u{1b}[2K│ മലയാളം \u{e000} │", to: session)
             _ = text.refresh()
-            XCTAssertNil(helper.malayalamDisplayMap, "failed boxed-table preparation cannot mix shared geometry")
+            let badRow = session.screen.numberOfScrollbackLines() + 1
+            XCTAssertNil(helper.malayalamLayout(atLine: badRow), "unsupported boxed text still refuses natural layout")
+            let map = try XCTUnwrap(helper.malayalamDisplayMap, "failed boxed rows must not disable their neighbors")
+            let pieces = map.fragments(forSourceRow: Int(badRow))
+            XCTAssertEqual(pieces.count, 1)
+            XCTAssertNil(pieces.first?.layout)
+            XCTAssertNil(pieces.first?.tableRow)
+            XCTAssertNil(pieces.first?.paragraph)
         }
     }
 
@@ -4920,10 +6488,17 @@ final class MalayalamFooterIntegrationTests: XCTestCase {
                 }
             }
         }
-        for source in ["कर्म ά", "കേ а", "कर्म \u{0301}", "कर्म a\u{fe0f}", "कर्म a\u{034f}", "nāmaḥ"] {
+        // Letters of other left-to-right scripts are admitted beside an enabled script; lone marks, invalid
+        // selectors and Latin-only rows are not.
+        for source in ["कर्म ά", "കേ а"] {
             let bytes = Array(("\u{1b}[H\u{1b}[2K" + source).utf8)
             await feedBytes(bytes, to: session, expectingExecutedBytes: session.executedBytes + bytes.count)
-            XCTAssertNil(text.drawingHelper.malayalamLayout(atLine: 0), "do not admit unrelated scripts, lone marks, invalid selectors or Latin-only rows")
+            XCTAssertNotNil(text.drawingHelper.malayalamLayout(atLine: 0), "admit another script's letters beside an enabled one: \(source)")
+        }
+        for source in ["कर्म \u{0301}", "कर्म a\u{fe0f}", "कर्म a\u{034f}", "nāmaḥ"] {
+            let bytes = Array(("\u{1b}[H\u{1b}[2K" + source).utf8)
+            await feedBytes(bytes, to: session, expectingExecutedBytes: session.executedBytes + bytes.count)
+            XCTAssertNil(text.drawingHelper.malayalamLayout(atLine: 0), "do not admit lone marks, invalid selectors or Latin-only rows")
         }
         defaults.set(false, forKey: "HindiNaturalRows")
         iTermAdvancedSettingsModel.loadAdvancedSettingsFromUserDefaults()

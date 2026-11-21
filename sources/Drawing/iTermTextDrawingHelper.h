@@ -131,6 +131,11 @@ extern const CGFloat iTermCursorGuideAlphaThreshold;
 @interface iTermTextDrawingHelper : NSObject
 
 @property(nonatomic, readonly) iTermMalayalamTableSource *malayalamPreparedTableSource;
+// After a malayalamLayoutAtLine:mapEligible: call: YES when the row was examined and cannot be laid out
+// (image, bidi, double width, wrong width). The display map draws such a row as one plain row.
+@property(nonatomic, readonly) BOOL malayalamLastRowIsPlain;
+// Why the last malayalamLayoutAtLine: call refused to lay out a row it had to prepare, or nil.
+@property(nonatomic, readonly, copy) NSString *malayalamLastRefusalReason;
 @property(nonatomic, readonly) NSUInteger malayalamRowLayoutBuildCount;
 @property(nonatomic, readonly) NSUInteger malayalamRowLayoutPreparationCount;
 
@@ -142,6 +147,10 @@ extern const CGFloat iTermCursorGuideAlphaThreshold;
 // Nonnull outputs, prose metadata shares the canonical row fetch while paragraph flow is enabled.
 - (iTermMalayalamRowLayout *)malayalamLayoutAtLine:(int)line mapEligible:(BOOL *)eligible
                                       sourceEol:(int *)eol sourceText:(NSString **)sourceText;
+// For the map pass: the layout of a row that the terminal soft-wrapped onto a natural-script row, when the row holds
+// no natural script itself (a lone ".", an ASCII word). Nil when it cannot be laid out.
+- (iTermMalayalamRowLayout *)malayalamContinuationLayoutAtLine:(int)line mapEligible:(BOOL *)eligible
+                                                      sourceEol:(int *)eol sourceText:(NSString **)sourceText;
 // The shift is only a previous-layout hint; row eligibility and full builder equality still apply.
 - (void)beginMalayalamMapPassWithPreviousSourceRowShift:(NSInteger)shift;
 - (void)endMalayalamMapPass;
